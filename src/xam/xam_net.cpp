@@ -699,6 +699,92 @@ u32 NetDll_XNetInAddrToXnAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<in_ad
   return 0;
 }
 
+// ---- System Link session keys and connections (bo2-bisect syslink/0001) ----------------------
+// System Link peers share the LAN and there is no secure transport to set up, so registering keys
+// and connecting succeed without touching guest memory, and a connection reports CONNECTED. As
+// stubs these left r3 unset: a joining BO2 polled XNetGetConnectStatus and never got CONNECTED, so
+// pressing A on a listed game did nothing.
+
+u32 NetDll_XNetRegisterKey_entry([[maybe_unused]] u32 caller, [[maybe_unused]] MappedVoid key_id,
+                                 [[maybe_unused]] MappedVoid key_exchange) {
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry([[maybe_unused]] u32 caller,
+                                   [[maybe_unused]] MappedVoid key_id) {
+  return 0;
+}
+
+u32 NetDll_XNetCreateKey_entry([[maybe_unused]] u32 caller, GuestPtrT<u8> key_id_out,
+                               GuestPtrT<u8> key_out) {
+  // An 8 byte XNKID and a 16 byte XNKEY of random bytes (a zero key session is one no peer joins).
+  if (key_id_out && key_out) {
+    const u64 kid = HostRandomU64();
+    const u64 key[2] = {HostRandomU64(), HostRandomU64()};
+    std::memcpy(key_id_out.GetHostPtr(), &kid, sizeof(kid));
+    std::memcpy(key_out.GetHostPtr(), key, sizeof(key));
+  }
+  return 0;
+}
+
+u32 NetDll_XNetServerToInAddr_entry([[maybe_unused]] u32 caller,
+                                    [[maybe_unused]] u32 server_address, [[maybe_unused]] u32 flags,
+                                    [[maybe_unused]] MappedVoid in_addr_out) {
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterInAddr_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 in_addr) {
+  return 0;
+}
+
+u32 NetDll_XNetConnect_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 in_addr) {
+  return 0;
+}
+
+u32 NetDll_XNetGetConnectStatus_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 in_addr) {
+  // XNET_CONNECT_STATUS_CONNECTED (0 idle, 1 connecting, 2 connected).
+  return 2;
+}
+
+u32 NetDll_XnpLogonGetStatus_entry([[maybe_unused]] u32 r3, [[maybe_unused]] u32 r4,
+                                   [[maybe_unused]] u32 r5, [[maybe_unused]] u32 r6) {
+  return 0;
+}
+
+// XNetLogon* take no caller argument, unlike NetDll_*.
+u32 XNetLogonGetMachineID_entry(GuestPtrT<u8> machine_id_out) {
+  if (!machine_id_out) {
+    return 1;
+  }
+  u8 mac[6] = {};
+  HostEthernetAddress(mac);
+  u8* out = machine_id_out.GetHostPtr();
+  std::memset(out, 0, 16);
+  std::memcpy(out, mac, sizeof(mac));
+  std::memcpy(out + 8, mac, sizeof(mac));
+  return 0;
+}
+
+u32 XNetLogonGetTitleID_entry([[maybe_unused]] u32 index) {
+  // The title stores the return value; it passes an index, not a pointer.
+  return CurrentXAM().GetTitleID();
+}
+
+u32 NetDll_getpeername_entry([[maybe_unused]] u32 caller, u32 socket_handle,
+                             GuestPtrT<XSOCKADDR_IN> name, MappedU32 name_len_ptr) {
+  if (!GetSocket(socket_handle)) {
+    return static_cast<u32>(-1);
+  }
+  if (name) {
+    std::memset(name.GetHostPtr(), 0, sizeof(XSOCKADDR_IN));
+    name->sin_family = 2;
+  }
+  if (name_len_ptr) {
+    *name_len_ptr = sizeof(XSOCKADDR_IN);
+  }
+  return 0;
+}
+
 u32 NetDll_XNetSetSystemLinkPort_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 port) {
   return 1;
 }
@@ -1276,6 +1362,17 @@ REX_XAM_BODY(__imp__NetDll_XNetInAddrToString, rex::xam::NetDll_XNetInAddrToStri
 REX_XAM_BODY(__imp__NetDll_XNetXnAddrToInAddr, rex::xam::NetDll_XNetXnAddrToInAddr_entry)
 REX_XAM_BODY(__imp__NetDll_XNetInAddrToXnAddr, rex::xam::NetDll_XNetInAddrToXnAddr_entry)
 REX_XAM_BODY(__imp__NetDll_XNetSetSystemLinkPort, rex::xam::NetDll_XNetSetSystemLinkPort_entry)
+REX_XAM_BODY(__imp__NetDll_XNetRegisterKey, rex::xam::NetDll_XNetRegisterKey_entry)
+REX_XAM_BODY(__imp__NetDll_XNetUnregisterKey, rex::xam::NetDll_XNetUnregisterKey_entry)
+REX_XAM_BODY(__imp__NetDll_XNetCreateKey, rex::xam::NetDll_XNetCreateKey_entry)
+REX_XAM_BODY(__imp__NetDll_XNetServerToInAddr, rex::xam::NetDll_XNetServerToInAddr_entry)
+REX_XAM_BODY(__imp__NetDll_XNetUnregisterInAddr, rex::xam::NetDll_XNetUnregisterInAddr_entry)
+REX_XAM_BODY(__imp__NetDll_XNetConnect, rex::xam::NetDll_XNetConnect_entry)
+REX_XAM_BODY(__imp__NetDll_XNetGetConnectStatus, rex::xam::NetDll_XNetGetConnectStatus_entry)
+REX_XAM_BODY(__imp__NetDll_XnpLogonGetStatus, rex::xam::NetDll_XnpLogonGetStatus_entry)
+REX_XAM_BODY(__imp__XNetLogonGetMachineID, rex::xam::XNetLogonGetMachineID_entry)
+REX_XAM_BODY(__imp__XNetLogonGetTitleID, rex::xam::XNetLogonGetTitleID_entry)
+REX_XAM_BODY(__imp__NetDll_getpeername, rex::xam::NetDll_getpeername_entry)
 REX_XAM_BODY(__imp__NetDll_XNetGetEthernetLinkStatus,
              rex::xam::NetDll_XNetGetEthernetLinkStatus_entry)
 REX_XAM_BODY(__imp__NetDll_XNetDnsLookup, rex::xam::NetDll_XNetDnsLookup_entry)
