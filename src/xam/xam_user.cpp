@@ -221,7 +221,10 @@ u32 XamUserReadProfileSettingsEx([[maybe_unused]] u32 title_id, u32 user_index, 
     return kernel::X_ERROR_INSUFFICIENT_BUFFER;
   }
 
-  if (!by_xuid && user_index) {
+  // The offline split screen users (kernel.signed_in_users) read the profile's settings, as every
+  // user index did in the BO2 recompile's older runtime (bd833a2). Rejecting them kept BO2 from
+  // loading player 2's profile, so a second controller could not join.
+  if (!by_xuid && user_index && !IsExtraSignedInUser(user_index)) {
     if (overlapped) {
       CurrentTitle().overlapped_dispatcher.Complete(
           CurrentTitle().membase.HostToGuestVirtual(overlapped),
@@ -242,7 +245,11 @@ u32 XamUserReadProfileSettingsEx([[maybe_unused]] u32 title_id, u32 user_index, 
       CurrentTitle().membase.HostToGuestVirtual(buffer), buffer, buffer_size, needed_header_size);
   for (u32 x = 0; x < xuid_entries; ++x) {
     const u64 xuid = by_xuid ? static_cast<u64>(xuids[x]) : 0;
-    const bool own_profile = !by_xuid || xuid == user_profile.GetXUID();
+    bool own_profile = !by_xuid || xuid == user_profile.GetXUID();
+    for (u32 extra = 1; !own_profile && extra < 4; ++extra) {
+      own_profile = IsExtraSignedInUser(extra) &&
+                    xuid == LocalUserXuid(user_profile.GetXUID(), extra);
+    }
     for (u32 n = 0; n < setting_count; ++n) {
       u32 setting_id = setting_ids[n];
       rex::xam::UserProfile::Setting* setting =
