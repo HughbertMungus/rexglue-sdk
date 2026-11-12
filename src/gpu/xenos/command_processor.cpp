@@ -414,8 +414,10 @@ void CommandProcessor::WriteRegister(u32 index, u32 value) {
     if ((1 << scratch_reg) & regs.values[std::to_underlying(xenos::Register::SCRATCH_UMSK)]) {
       u32 scratch_addr = regs.values[std::to_underlying(xenos::Register::SCRATCH_ADDR)];
       u32 mem_addr = scratch_addr + (scratch_reg * 4);
-      SyncGuestVisible();  // queued upload copies first (async upload copies)
-      StoreReleaseHost(physical_memory_, mem_addr, value);
+      if (!DeferGuestStore(mem_addr, value)) {
+        SyncGuestVisible();  // queued upload copies first (async upload copies)
+        StoreReleaseHost(physical_memory_, mem_addr, value);
+      }
     }
   } else {
     switch (index) {
@@ -698,6 +700,9 @@ void CommandProcessor::ExecutePacket(u32 ptr, u32 count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (deferred_pending_) {
+    ApplyDeferredGuestWrites();
+  }
   const u32 packet = reader->ReadAndSwap<u32>();
   const u32 packet_type = packet >> 30;
   if (packet == 0) {
@@ -732,6 +737,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, u32 packet
 
   u32 base_index = (packet & 0x7FFF);
   u32 write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && count > 1 && GetXenosSettings().bulk_register_writes.Get()) {
+    // One range (WriteRegistersFromMem, which drivers implement per register category) instead of
+    // one virtual WriteRegister per register (bo2-bisect perf/0031).
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (u32 m = 0; m < count; m++) {
     u32 reg_data = reader->ReadAndSwap<u32>();
     u32 target_index = write_one_reg ? base_index : base_index + m;
@@ -928,9 +939,15 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader,
   return true;
 }
 
+void CommandProcessor::StoreDeferredGuestValue(u32 address, u32 host_raw) {
+  StoreReleaseHost(physical_memory_, address, host_raw);
+}
+
 std::string CommandProcessor::FpsLogTags() const {
   return "pc=" + std::to_string(GetXenosSettings().clear_memory_page_state.Get() ? 1 : 0) +
-         " iw=" + std::to_string(GetXenosSettings().cpu_write_invalidation_pages_log2.Get());
+         " iw=" + std::to_string(GetXenosSettings().cpu_write_invalidation_pages_log2.Get()) +
+         " fp=" + std::to_string(GetXenosSettings().shared_memory_fast_path.Get() ? 1 : 0) +
+         " br=" + std::to_string(GetXenosSettings().bulk_register_writes.Get() ? 1 : 0);
 }
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
@@ -1029,7 +1046,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     u32 value = 0;
     if (is_memory) {
-      value = LoadAcquire(physical_memory_, poll_reg_addr & ~static_cast<u32>(0x3));
+      // The command processor sees its own deferred stores, in order, as hardware would.
+      if (deferred_pending_) {
+        ApplyDeferredGuestWrites();
+      }
+      u32 pending_raw = 0;
+      if (deferred_pending_ &&
+          PeekDeferredGuestStore(poll_reg_addr & ~static_cast<u32>(0x3), &pending_raw)) {
+        value = rex::byte_swap(pending_raw);
+      } else {
+        value = LoadAcquire(physical_memory_, poll_reg_addr & ~static_cast<u32>(0x3));
+      }
       value = xenos::GPUSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -1162,6 +1189,9 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
   if (wait_info & 0x10) {
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    if (deferred_pending_) {
+      SyncGuestVisible();  // deferred stores first
+    }
     value = LoadAcquire(physical_memory_, poll_reg_addr);
     value = GPUSwap(value, endianness);
   } else {
@@ -1241,8 +1271,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GPUSwap(data_value, endianness);
-  SyncGuestVisible();  // queued upload copies first (async upload copies)
-  StoreRelease(physical_memory_, address, data_value);
+  if (!DeferGuestStore(address, rex::byte_swap(data_value))) {
+    SyncGuestVisible();  // queued upload copies first (async upload copies)
+    StoreRelease(physical_memory_, address, data_value);
+  }
   return true;
 }
 

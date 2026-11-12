@@ -344,13 +344,96 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+namespace {
+
+/** A vector of ranges that lives on the stack up to its inline capacity. */
+class SmallRangeVector {
+ public:
+  SmallRangeVector(size_t capacity_hint, size_t inline_capacity) {
+    if (capacity_hint > inline_capacity) {
+      heap_.reserve(capacity_hint);
+      use_heap_ = true;
+    }
+  }
+  void emplace_back(u32 first, u32 second) {
+    if (use_heap_) {
+      heap_.emplace_back(first, second);
+    } else {
+      inline_[size_++] = {first, second};
+    }
+  }
+  bool empty() const { return size() == 0; }
+  size_t size() const { return use_heap_ ? heap_.size() : size_; }
+  std::pair<u32, u32>* begin() { return use_heap_ ? heap_.data() : inline_; }
+  std::pair<u32, u32>* end() { return begin() + size(); }
+  std::pair<u32, u32>& operator[](size_t i) { return begin()[i]; }
+  void resize(size_t n) {
+    if (use_heap_) {
+      heap_.resize(n);
+    } else {
+      size_ = n;
+    }
+  }
+
+ private:
+  std::pair<u32, u32> inline_[16];
+  size_t size_ = 0;
+  std::vector<std::pair<u32, u32>> heap_;
+  bool use_heap_ = false;
+};
+
+}  // namespace
+
 bool SharedMemory::RequestRanges(const std::pair<u32, u32>* ranges, size_t count) {
   if (ranges == nullptr || !count) {
     return true;
   }
 
-  std::vector<std::pair<u32, u32>> merged_ranges;
-  merged_ranges.reserve(count);
+  if (fast_path_.load(std::memory_order_relaxed)) {
+    // Almost every request covers pages that are valid already (uploaded and unmodified since):
+    // answer those without the lock, the sort and merge and the sparse allocation check (valid
+    // pages are always allocated). A page invalidated right after this check is equivalent to one
+    // invalidated right after the locked check (bo2-bisect perf/0013).
+    const volatile u64* valid_bits = system_page_flags_valid_.data();
+    bool all_valid = true;
+    for (size_t i = 0; i < count && all_valid; ++i) {
+      const u32 start = ranges[i].first;
+      const u32 length = ranges[i].second;
+      if (!length) {
+        continue;
+      }
+      if (start > kBufferSize || (kBufferSize - start) < length) {
+        all_valid = false;
+        break;
+      }
+      const u32 page_first = start >> page_size_log2_;
+      const u32 page_last = (start + length - 1) >> page_size_log2_;
+      const u32 block_first = page_first >> 6;
+      const u32 block_last = page_last >> 6;
+      for (u32 b = block_first; b <= block_last; ++b) {
+        u64 mask = ~u64{0};
+        if (b == block_first) {
+          mask &= ~((u64{1} << (page_first & 63)) - 1);
+        }
+        if (b == block_last && (page_last & 63) != 63) {
+          mask &= (u64{1} << ((page_last & 63) + 1)) - 1;
+        }
+        const u64 bits = valid_bits[b];
+        if ((bits & mask) != mask) {
+          all_valid = false;
+          break;
+        }
+      }
+    }
+    if (all_valid) {
+      return true;
+    }
+  }
+
+  // Called for every draw (index and vertex buffers), nearly always with one range: the merge
+  // buffer stays on the stack instead of a heap allocation per call (bo2-bisect perf/0002).
+  constexpr size_t kInlineRanges = 16;
+  SmallRangeVector merged_ranges(count, kInlineRanges);
   for (size_t i = 0; i < count; ++i) {
     u32 start = ranges[i].first;
     u32 length = ranges[i].second;

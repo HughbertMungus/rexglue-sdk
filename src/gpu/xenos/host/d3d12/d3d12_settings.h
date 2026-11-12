@@ -43,6 +43,12 @@ class D3D12Settings : public SettingOwner {
               "At frame start, upload again in one batch the parts of the ranges uploaded on demand "
               "in this many previous frames that are invalid again, 0 turns it off",
               Range{0, 7});
+  REX_SETTING(bool, fetch_dedup, false,
+              "Skip texture rebinds and the fetch constant buffer update for fetch constant writes "
+              "that do not change the value");
+  REX_SETTING(bool, defer_guest_stores, false,
+              "With upload copy workers, queue fence and scratch stores behind the pending copies "
+              "instead of waiting for them");
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");

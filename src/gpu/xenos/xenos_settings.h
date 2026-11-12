@@ -72,6 +72,12 @@ class XenosSettings : public SettingOwner {
   REX_SETTING(bool, clear_memory_page_state, true,
               "Refresh the page valid state from GPU written memory at frame end. Turning it off "
               "lowers CPU cost but may break memory coherency");
+  REX_SETTING(bool, bulk_register_writes, false,
+              "Apply multi register type 0 packets as one range, with render state copied in bulk, "
+              "instead of one register write call per register");
+  REX_SETTING(bool, shared_memory_fast_path, false,
+              "Answer GPU memory range requests whose pages are all valid without the lock, sort "
+              "and merge");
   REX_SETTING(i32, cpu_write_invalidation_pages_log2, 6,
               "How far a CPU write's invalidation of GPU memory widens around the written pages, as "
               "log2 pages (0 = only the written pages, 6 = up to the 64 page block). Wider means "

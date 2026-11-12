@@ -1763,6 +1763,10 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(u32 index, u32 value) {
+  const bool fetch_unchanged =
+      index >= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0) &&
+      index <= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_31_5) &&
+      register_file_->values[index] == value && GetD3D12Settings().fetch_dedup.Get();
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X) &&
@@ -1788,10 +1792,13 @@ void D3D12CommandProcessor::WriteRegister(u32 index, u32 value) {
     cbuffer_binding_bool_loop_.up_to_date = false;
   } else if (index >= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0) &&
              index <= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_31_5)) {
-    cbuffer_binding_fetch_.up_to_date = false;
-    if (texture_cache_ != nullptr) {
-      texture_cache_->TextureFetchConstantWritten(
-          (index - std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0)) / 6);
+    // fetch_dedup: a write of the value already there changes no binding (bo2-bisect perf/0014).
+    if (!fetch_unchanged) {
+      cbuffer_binding_fetch_.up_to_date = false;
+      if (texture_cache_ != nullptr) {
+        texture_cache_->TextureFetchConstantWritten(
+            (index - std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0)) / 6);
+      }
     }
     InvalidateVertexBufferResidency(
         (index - std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0)) / 2);
@@ -1803,6 +1810,34 @@ void D3D12CommandProcessor::WriteRegistersFromMem(u32 start_index, u32* base, u3
     return;
   }
   u32 end_index = start_index + num_registers - 1;
+
+  if (GetXenosSettings().bulk_register_writes.Get()) {
+    // Split ranges that cross register categories, so each part takes its own path.
+    static constexpr u32 kBoundaries[] = {
+        0x2000,
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X),
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_511_W) + 1,
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0),
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_31_5) + 1,
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_BOOL_000_031),
+        std::to_underlying(xenos::Register::SHADER_CONSTANT_LOOP_31) + 1};
+    for (u32 boundary : kBoundaries) {
+      if (start_index < boundary && end_index >= boundary) {
+        const u32 first_count = boundary - start_index;
+        WriteRegistersFromMem(start_index, base, first_count);
+        WriteRegistersFromMem(boundary, base + first_count, num_registers - first_count);
+        return;
+      }
+    }
+    // Render state (0x2000 up to the constants) has no write side effects: the driver reads it
+    // from the register file at draw time. Every register with side effects is below 0x2000
+    // (scratch, COHER, gamma ramp) or a constant, which keep their own paths.
+    if (start_index >= 0x2000 &&
+        end_index < std::to_underlying(xenos::Register::SHADER_CONSTANT_000_X)) {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+      return;
+    }
+  }
 
   auto range_has_any_constant_usage = [](const u64* usage_map, u32 first_constant,
                                          u32 last_constant) -> bool {
@@ -1866,14 +1901,39 @@ void D3D12CommandProcessor::WriteRegistersFromMem(u32 start_index, u32* base, u3
 
   if (start_index >= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0) &&
       end_index <= std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_31_5)) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    cbuffer_binding_fetch_.up_to_date = false;
     u32 first_fetch_dword =
         start_index - std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0);
     u32 last_fetch_dword =
         end_index - std::to_underlying(xenos::Register::SHADER_CONSTANT_FETCH_00_0);
-    if (texture_cache_) {
-      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    if (GetD3D12Settings().fetch_dedup.Get()) {
+      // Only fetch constants whose value changed need their bindings evaluated again; texture
+      // data changes are tracked through memory watches (bo2-bisect perf/0014).
+      u32 changed_texture_slots = 0;
+      for (u32 i = 0; i < num_registers; ++i) {
+        const u32 value = memory::load_and_swap<u32>(base + i);
+        u32& reg = register_file_->values[start_index + i];
+        if (reg != value) {
+          reg = value;
+          changed_texture_slots |= u32{1} << ((first_fetch_dword + i) / 6);
+        }
+      }
+      if (changed_texture_slots) {
+        cbuffer_binding_fetch_.up_to_date = false;
+        if (texture_cache_) {
+          u32 slots = changed_texture_slots;
+          u32 slot;
+          while (rex::bit_scan_forward(slots, &slot)) {
+            slots &= ~(u32{1} << slot);
+            texture_cache_->TextureFetchConstantWritten(slot);
+          }
+        }
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+      cbuffer_binding_fetch_.up_to_date = false;
+      if (texture_cache_) {
+        texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+      }
     }
     InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
@@ -2249,6 +2309,46 @@ void D3D12CommandProcessor::SyncGuestVisible() {
   if (shared_memory_ && !shared_memory_->UploadsDone(shared_memory_->UploadTicket())) {
     shared_memory_->WaitForUploads(shared_memory_->UploadTicket());
   }
+  if (deferred_pending_) {
+    ApplyDeferredGuestWrites();  // All copies are done, so all of them.
+  }
+}
+
+bool D3D12CommandProcessor::DeferGuestStore(u32 address, u32 host_raw) {
+  if (deferred_pending_) {
+    ApplyDeferredGuestWrites();
+  }
+  if (!shared_memory_ || shared_memory_->UploadsDone(shared_memory_->UploadTicket())) {
+    // Nothing queued. Older pending stores were applied above, their tickets being <= this one.
+    return false;
+  }
+  // Once stores are pending, later ones queue too, so they stay in order.
+  if (!deferred_pending_ && !GetD3D12Settings().defer_guest_stores.Get()) {
+    return false;
+  }
+  deferred_stores_.push_back(DeferredStore{shared_memory_->UploadTicket(), address, host_raw});
+  deferred_pending_ = true;
+  return true;
+}
+
+void D3D12CommandProcessor::ApplyDeferredGuestWrites() {
+  while (!deferred_stores_.empty() &&
+         (!shared_memory_ || shared_memory_->UploadsDone(deferred_stores_.front().ticket))) {
+    const DeferredStore& store = deferred_stores_.front();
+    StoreDeferredGuestValue(store.address, store.host_raw);
+    deferred_stores_.pop_front();
+  }
+  deferred_pending_ = !deferred_stores_.empty();
+}
+
+bool D3D12CommandProcessor::PeekDeferredGuestStore(u32 address, u32* host_raw) {
+  for (auto it = deferred_stores_.rbegin(); it != deferred_stores_.rend(); ++it) {
+    if (it->address == address) {
+      *host_raw = it->host_raw;
+      return true;
+    }
+  }
+  return false;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -3435,6 +3535,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (shared_memory_) {
       shared_memory_->SetInvalidationWidthLog2(
           static_cast<u32>(GetXenosSettings().cpu_write_invalidation_pages_log2.Get()));
+      shared_memory_->SetFastPath(GetXenosSettings().shared_memory_fast_path.Get());
     }
     frame_open_ = false;
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;

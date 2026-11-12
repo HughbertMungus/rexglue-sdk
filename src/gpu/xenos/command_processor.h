@@ -277,6 +277,26 @@ class REX_GPU_XENOS_API CommandProcessor : public rex::NonCopyable {
   virtual void SyncGuestVisible() {}
 
   /**
+   * Deferred guest-visible stores (gpu.d3d12.defer_guest_stores, bo2-bisect perf/0044). Instead
+   * of waiting for queued upload copies, a fence or scratch store can be queued behind them
+   * (DeferGuestStore returns true); it is written as soon as those copies are done
+   * (ApplyDeferredGuestWrites, checked per packet). SyncGuestVisible flushes them, and the
+   * command processor's own memory polls see pending values (PeekDeferredGuestStore).
+   * host_raw is the 32 bit value exactly as it goes to memory.
+   */
+  virtual bool DeferGuestStore([[maybe_unused]] u32 address, [[maybe_unused]] u32 host_raw) {
+    return false;
+  }
+  virtual void ApplyDeferredGuestWrites() {}
+  virtual bool PeekDeferredGuestStore([[maybe_unused]] u32 address,
+                                      [[maybe_unused]] u32* host_raw) {
+    return false;
+  }
+  /** Writes a store DeferGuestStore queued. */
+  void StoreDeferredGuestValue(u32 address, u32 host_raw);
+  bool deferred_pending_ = false;
+
+  /**
    * The switches tagged on each REX_FPS_LOG line: pc= page clear, iw= CPU write invalidation
    * width (log2 pages). Drivers append their own.
    */

@@ -241,12 +241,23 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   void SyncGuestVisible() override;
+  bool DeferGuestStore(u32 address, u32 host_raw) override;
+  void ApplyDeferredGuestWrites() override;
+  bool PeekDeferredGuestStore(u32 address, u32* host_raw) override;
+  struct DeferredStore {
+    u64 ticket;  // Written once shared memory upload copies < ticket are done.
+    u32 address;
+    u32 host_raw;
+  };
+  std::deque<DeferredStore> deferred_stores_;
   /** Adds rp= async replay, uw= upload copy workers, pf= upload prefetch frames. */
   std::string FpsLogTags() const override {
     return CommandProcessor::FpsLogTags() +
            " rp=" + std::to_string(GetD3D12Settings().async_replay.Get() ? 1 : 0) +
            " uw=" + std::to_string(GetD3D12Settings().upload_copy_workers.Get()) +
-           " pf=" + std::to_string(GetD3D12Settings().upload_prefetch_frames.Get());
+           " pf=" + std::to_string(GetD3D12Settings().upload_prefetch_frames.Get()) +
+           " ds=" + std::to_string(GetD3D12Settings().defer_guest_stores.Get() ? 1 : 0) +
+           " fd=" + std::to_string(GetD3D12Settings().fetch_dedup.Get() ? 1 : 0);
   }
 
   Shader* LoadShader(xenos::ShaderType shader_type, u32 guest_address, const u32* host_address,
