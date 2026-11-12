@@ -1475,7 +1475,6 @@ REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
 REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
 REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);

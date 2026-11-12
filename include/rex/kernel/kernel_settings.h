@@ -26,6 +26,10 @@ class REX_KERNEL_API KernelSettings final : public SettingOwner {
   REX_SETTING(u32, license_mask, 0, "Content license mask", kUntilLaunch);
   REX_SETTING(std::string, command_line, "", "Arguments the title sees after default.xex",
               kUntilLaunch);
+  REX_SETTING(u32, signed_in_users, 1,
+              "Local users signed in to profiles, 1 to 4. Users 2 to 4 get offline profiles "
+              "for local split screen",
+              Range{1, 4}, kUntilLaunch);
 
   KernelSettings();
 };

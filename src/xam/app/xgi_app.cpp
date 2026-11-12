@@ -18,6 +18,9 @@
 #include <rex/xam/app_manager.h>
 #include <rex/xam/title_lifecycle.h>
 #include "xam/stub_log.h"
+#include "xam/host_identity.h"
+
+#include <cstring>
 
 namespace rex {
 namespace xam {
@@ -45,6 +48,10 @@ kernel::X_HRESULT XGIApp::DispatchMessageSync(u32 message, u32 buffer_ptr, u32 b
       u32 context_value = args->context_value;
       REXXAM_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                    context_value);
+      {
+        std::lock_guard lock(contexts_mutex_);
+        contexts_[(u64{user_index} << 32) | context_id] = context_value;
+      }
       return kernel::X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -136,6 +143,36 @@ kernel::X_HRESULT XGIApp::DispatchMessageSync(u32 message, u32 buffer_ptr, u32 b
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+      // A host create (XSESSION_CREATE_HOST, 0x1) gets this machine's session info, as the BO2
+      // recompile's app wrote it: left untouched, BO2 rejects LOCAL with "You must have an active
+      // network connection" and deletes the session. A client create (System Link join, flags
+      // 0x20) arrives with the host's info already filled in by the title and must keep it:
+      // overwriting it made the client send its session traffic to itself.
+      constexpr u32 kSessionCreateHost = 0x1;
+      if (session_info_ptr && (flags & kSessionCreateHost)) {
+        struct XNADDR_GUEST {
+          be_u32 ina;
+          be_u32 ina_online;
+          be_u16 port_online;
+          u8 ab_enet[6];
+          u8 ab_online[20];
+        };
+        // XNKID at 0x00, the host XNADDR at 0x08, XNKEY at 0x2C (unaligned, so bytes).
+        struct XSESSION_INFO_GUEST {
+          u8 xnkid[8];
+          XNADDR_GUEST host_address;
+          u8 xnkey[16];
+        };
+        REX_STATIC_ASSERT_SIZE(XSESSION_INFO_GUEST, 0x3C);
+        auto* info = membase_.TranslateVirtual<XSESSION_INFO_GUEST*>(session_info_ptr);
+        std::memset(info, 0, sizeof(*info));
+        const u64 xnkid = HostRandomU64();
+        const u64 xnkey[2] = {HostRandomU64(), HostRandomU64()};
+        std::memcpy(info->xnkid, &xnkid, sizeof(xnkid));
+        std::memcpy(info->xnkey, xnkey, sizeof(xnkey));
+        info->host_address.ina = HostLanAddress();
+        HostEthernetAddress(info->host_address.ab_enet);
+      }
       return kernel::X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -177,6 +214,13 @@ kernel::X_HRESULT XGIApp::DispatchMessageSync(u32 message, u32 buffer_ptr, u32 b
       REXXAM_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                    is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                    user_count, xuid_array_ptr, user_index_array, private_slots_array);
+      return kernel::X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      // XGISessionLeaveLocal, the counterpart of 0x000B0012: session, user count, user index
+      // array (bo2-bisect's app answered it with success; unhandled it failed with an error line
+      // per call while BO2 sits in its menus).
+      REXXAM_DEBUG("XGISessionLeaveLocal({:08X}, {:08X})", buffer_ptr, buffer_length);
       return kernel::X_E_SUCCESS;
     }
     case 0x000B0014: {
@@ -574,11 +618,19 @@ kernel::X_HRESULT XGIApp::DispatchMessageSync(u32 message, u32 buffer_ptr, u32 b
       u32 context_id = context ? u32{context->id} : 0;
       REXXAM_DEBUG("XGIUserGetContext({:08X}, {:08X}, {:08X}))", user_index, context_ptr,
                    context_id);
+      // The value XGIUserSetContextEx stored, 0 when none (bo2-bisect app, legacy XGI).
       u32 value = 0;
+      {
+        std::lock_guard lock(contexts_mutex_);
+        auto it = contexts_.find((u64{user_index} << 32) | context_id);
+        if (it != contexts_.end()) {
+          value = it->second;
+        }
+      }
       if (context) {
         context->value = value;
       }
-      return kernel::X_E_FAIL;
+      return kernel::X_E_SUCCESS;
     }
     case 0x000B0060: {
       REX_ASSERT(!buffer_length || buffer_length == 32);

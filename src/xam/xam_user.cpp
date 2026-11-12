@@ -36,11 +36,30 @@
 #include "xam/stub_log.h"
 #include <rex/kernel/types/content.h>
 #include "xam/xam_bodies.h"
+#include "xam/host_identity.h"
+
+#include <string>
 
 namespace rex {
 namespace xam {
 
 using namespace rex::kernel;
+
+namespace {
+
+/**
+ * Users 1 to kernel.signed_in_users - 1 are signed in to offline profiles for local split screen
+ * (bo2-bisect app xam.cpp, BO2MP_MU_*). User 0 keeps the real profile.
+ */
+bool IsExtraSignedInUser(u32 user_index) {
+  return user_index > 0 && user_index < 4 && user_index < CurrentTitle().signed_in_users;
+}
+
+std::string ExtraUserName(u32 user_index) {
+  return "Player " + std::to_string(user_index + 1);
+}
+
+}  // namespace
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, MappedU64 xuid_ptr) {
   REX_ASSERT(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -58,6 +77,9 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, MappedU64 xuid_ptr) {
         xuid = user_profile.GetXUID();
         result = kernel::X_E_SUCCESS;
       }
+    } else if (IsExtraSignedInUser(user_index)) {
+      xuid = LocalUserXuid(CurrentXAM().GetUserProfile().GetXUID(), user_index);
+      result = kernel::X_E_SUCCESS;
     }
   } else {
     result = kernel::X_E_INVALIDARG;
@@ -72,6 +94,8 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
     if (user_index == 0) {
       auto& user_profile = CurrentXAM().GetUserProfile();
       signin_state = user_profile.GetSigninState();
+    } else if (IsExtraSignedInUser(user_index)) {
+      signin_state = 1;  // signed in locally
     }
   }
   return signin_state;
@@ -94,13 +118,17 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, [[maybe_unused]] u32 flags,
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (user_index && !IsExtraSignedInUser(user_index)) {
     return static_cast<i32>(kernel::X_E_NO_SUCH_USER);
   }
 
   auto& user_profile = CurrentXAM().GetUserProfile();
-  info->xuid = user_profile.GetXUID();
-  info->signin_state = user_profile.GetSigninState();
+  info->xuid = LocalUserXuid(user_profile.GetXUID(), user_index);
+  info->signin_state = user_index ? 1u : user_profile.GetSigninState();
+  if (user_index) {
+    // As bo2-bisect wrote it: unk08 holds the user index for the offline users.
+    info->unk08 = user_index;
+  }
   rex::string::CopyTruncating(info->name, user_profile.GetName(), rex::CountOf(info->name));
   return kernel::X_E_SUCCESS;
 }
@@ -110,12 +138,12 @@ u32 XamUserGetName_entry(u32 user_index, MappedString buffer, u32 buffer_len) {
     return kernel::X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (user_index && !IsExtraSignedInUser(user_index)) {
     return kernel::X_E_NO_SUCH_USER;
   }
 
   auto& user_profile = CurrentXAM().GetUserProfile();
-  const auto& user_name = user_profile.GetName();
+  const std::string user_name = user_index ? ExtraUserName(user_index) : user_profile.GetName();
   rex::string::CopyTruncating(buffer, user_name, std::min(buffer_len, static_cast<u32>(16)));
   return kernel::X_E_SUCCESS;
 }
@@ -125,7 +153,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, MappedWString buffer, u32 buffer_le
     return kernel::X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (user_index && !IsExtraSignedInUser(user_index)) {
     return kernel::X_E_NO_SUCH_USER;
   }
 
@@ -134,7 +162,8 @@ u32 XamUserGetGamerTag_entry(u32 user_index, MappedWString buffer, u32 buffer_le
   }
 
   auto& user_profile = CurrentXAM().GetUserProfile();
-  auto user_name = rex::string::ToUTF16(user_profile.GetName());
+  auto user_name = rex::string::ToUTF16(user_index ? ExtraUserName(user_index)
+                                                   : user_profile.GetName());
   rex::string::CopyAndSwapTruncating(buffer, user_name, std::min(buffer_len, static_cast<u32>(16)));
   return kernel::X_E_SUCCESS;
 }
@@ -338,7 +367,8 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, [[maybe_unused]] u32 mask, Mappe
     }
   }
 
-  *out_value = 0;
+  // Granted. 0 denies every privilege, multiplayer sessions included (bo2-bisect returned 1).
+  *out_value = 1;
   return kernel::X_ERROR_SUCCESS;
 }
 
@@ -388,6 +418,11 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
     return kernel::X_ERROR_NO_SUCH_USER;
   }
   return 6;
+}
+
+u32 XamUserGetMembershipTierFromXUID_entry([[maybe_unused]] u64 xuid) {
+  // Gold, for every local and System Link player (bo2-bisect app, with signed in extra users).
+  return 2;
 }
 
 u32 XamUserAreUsersFriends_entry(u32 user_index, [[maybe_unused]] u32 unk1,
@@ -797,6 +832,8 @@ REX_XAM_BODY(__imp__XamUserContentRestrictionCheckAccess,
              rex::xam::XamUserContentRestrictionCheckAccess_entry)
 REX_XAM_BODY(__imp__XamUserIsOnlineEnabled, rex::xam::XamUserIsOnlineEnabled_entry)
 REX_XAM_BODY(__imp__XamUserGetMembershipTier, rex::xam::XamUserGetMembershipTier_entry)
+REX_XAM_BODY(__imp__XamUserGetMembershipTierFromXUID,
+             rex::xam::XamUserGetMembershipTierFromXUID_entry)
 REX_XAM_BODY(__imp__XamUserAreUsersFriends, rex::xam::XamUserAreUsersFriends_entry)
 REX_XAM_BODY(__imp__XamShowSigninUI, rex::xam::XamShowSigninUI_entry)
 REX_XAM_BODY(__imp__XamUserCreateAchievementEnumerator,

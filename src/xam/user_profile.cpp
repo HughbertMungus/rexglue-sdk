@@ -17,12 +17,15 @@
 #include <rex/platform/file.h>
 #include <rex/xam/content_manager.h>
 #include <rex/xam/user_profile.h>
+#include "xam/host_identity.h"
 
 namespace rex::xam {
 
 UserProfile::UserProfile() {
   // A title rejects any XUID with bits 54 or 55 set (mask 0x00C0000000000000).
-  xuid_ = 0xB13EBABEBABEBABE;
+  // The low 48 bits come from this machine (bo2-bisect syslink/0004): with one constant XUID on
+  // every machine, a System Link peer looked like the host's own player rejoining.
+  xuid_ = 0xB13E000000000000ull | (HostMachineHash() & 0x0000FFFFFFFFFFFFull);
   name_ = "User";
 
   // XPROFILE_GAMER_YAXIS_INVERSION

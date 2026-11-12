@@ -10,6 +10,7 @@ set(REXXAM_SOURCES
     content_manager.cpp
     content_package.cpp
     user_profile.cpp
+    host_identity.cpp
     xam_module.cpp
     xam_avatar.cpp
     xam_content.cpp

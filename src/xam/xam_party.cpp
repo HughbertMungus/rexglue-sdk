@@ -20,8 +20,13 @@
 namespace rex {
 namespace xam {
 
-u32 XamPartyGetUserList_entry([[maybe_unused]] u32 player_count,
-                              [[maybe_unused]] MappedU32 party_list) {
+u32 XamPartyGetUserList_entry([[maybe_unused]] u32 player_count, MappedU32 party_list) {
+  // An empty XPARTY_USER_LIST. BO2 ignores the return code and reads dwUserCount; unwritten it was
+  // stack garbage (~600), and its session player list merge walked that many entries of a
+  // 32 entry stack array, faulting as soon as a System Link peer joined (bo2-bisect syslink/0005).
+  if (party_list) {
+    *party_list = 0;
+  }
   // 0x807D0003 makes the title skip loading party data.
   return 0x807D0003;
 }

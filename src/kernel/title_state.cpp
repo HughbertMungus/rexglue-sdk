@@ -814,6 +814,7 @@ Result<void> TitleState::CreateXAM() {
           .file_system_factory = *GetKernelServices()->file_system,
           .membase = memory_->GetMembase(),
           .user_data_root = std::move(user_data_root),
+          .signed_in_users = GetKernelSettings().signed_in_users.Get(),
       });
       !attached) {
     return attached;

@@ -188,6 +188,11 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, [[maybe_unused]] u32 unk, Mapp
   *out_ptr = 0;
   if (!user_index || (user_index & 0xFF) == 0xFF) {
     return kernel::X_E_SUCCESS;
+  } else if (user_index < 4 && user_index < CurrentTitle().signed_in_users) {
+    // An offline split screen user (kernel.signed_in_users) is bound to its controller: the high
+    // nibble 7 marks a controller device (bo2-bisect app, BO2MP_MU_DEVCTX).
+    *out_ptr = 0x70000000u | user_index;
+    return kernel::X_E_SUCCESS;
   } else {
     return static_cast<i32>(kernel::X_E_DEVICE_NOT_CONNECTED);
   }

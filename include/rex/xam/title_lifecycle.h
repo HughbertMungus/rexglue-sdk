@@ -56,6 +56,7 @@ struct XAMKernelInterfaces {
   filesystem::IFileSystemFactory& file_system_factory; /**< Opens content packages and XDBF data. */
   rex::memory::GuestMembase membase;
   std::filesystem::path user_data_root; /**< Root of the per user data, empty when there is none. */
+  u32 signed_in_users = 1; /**< Local users signed in, 1 to 4 (kernel.signed_in_users). */
 };
 
 /** Title load and unload calls from the kernel to XAM. */

@@ -33,6 +33,7 @@
 #include <rex/kernel/object/event_object.h>
 #include <rex/kernel/object/object.h>
 #include "xam/socket_object.h"
+#include "xam/host_identity.h"
 #include <rex/kernel/thread_state.h>
 #include <rex/kernel/object/kernel_thread.h>
 #include <rex/platform/sync.h>
@@ -620,16 +621,16 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<XNADDR> addr_ptr) {
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+  // This machine's LAN address and a per machine ethernet address (bo2-bisect app). Loopback and
+  // CC:CC:CC:CC:CC:CC made every System Link host advertise an address no peer could reach, and
+  // every machine the same. abEnet must stay non zero: titles derive random numbers from it.
+  addr_ptr->ina.s_addr = htonl(HostLanAddress());
   addr_ptr->inaOnline.s_addr = 0;
   addr_ptr->wPortOnline = 0;
-
-  // A zero abEnet makes titles that derive random numbers from it fail.
-  std::memset(addr_ptr->abEnet, 0xCC, 6);
-
+  HostEthernetAddress(addr_ptr->abEnet);
   std::memset(addr_ptr->abOnline, 0, 20);
 
-  return XnAddrStatus::kXNetGetXNAddrStatic;
+  return XnAddrStatus::kXNetGetXNAddrEthernet | XnAddrStatus::kXNetGetXNAddrStatic;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<XNADDR> addr_ptr) {
@@ -638,30 +639,64 @@ u32 NetDll_XNetGetDebugXnAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<XNADD
   return XnAddrStatus::kXNetGetXNAddrNone;
 }
 
-u32 NetDll_XNetXnAddrToMachineId_entry([[maybe_unused]] u32 caller,
-                                       [[maybe_unused]] GuestPtrT<XNADDR> addr_ptr,
-                                       [[maybe_unused]] MappedU32 id_ptr) {
-  // Non zero means the title is not signed in to Live.
-  return 1;
+u32 NetDll_XNetXnAddrToMachineId_entry([[maybe_unused]] u32 caller, GuestPtrT<XNADDR> addr_ptr,
+                                       GuestPtrT<be_u64> id_ptr) {
+  // A 64 bit id from the address's ethernet address, so every peer has its own (bo2-bisect app).
+  if (id_ptr) {
+    u64 id = 0xFA00000000000000ull;
+    if (addr_ptr) {
+      for (int i = 0; i < 6; ++i) {
+        id |= static_cast<u64>(addr_ptr->abEnet[i]) << (8 * (5 - i));
+      }
+    }
+    *id_ptr = id;
+  }
+  return 0;
 }
 
-void NetDll_XNetInAddrToString_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 in_addr,
+void NetDll_XNetInAddrToString_entry([[maybe_unused]] u32 caller, u32 in_addr,
                                      MappedString string_out, u32 string_size) {
-  rex::string::CopyTruncating(string_out, "666.666.666.666", string_size);
+  // IN_ADDR by value: the register holds the address as a host order number.
+  if (!string_out || !string_size) {
+    return;
+  }
+  const std::string text = std::to_string((in_addr >> 24) & 0xFF) + "." +
+                           std::to_string((in_addr >> 16) & 0xFF) + "." +
+                           std::to_string((in_addr >> 8) & 0xFF) + "." +
+                           std::to_string(in_addr & 0xFF);
+  rex::string::CopyTruncating(string_out, text, string_size);
 }
 
-u32 NetDll_XNetXnAddrToInAddr_entry([[maybe_unused]] u32 caller,
-                                    [[maybe_unused]] GuestPtrT<XNADDR> xn_addr,
-                                    [[maybe_unused]] MappedVoid xid,
-                                    [[maybe_unused]] MappedVoid in_addr) {
-  return 1;
+u32 NetDll_XNetXnAddrToInAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<XNADDR> xn_addr,
+                                    [[maybe_unused]] MappedVoid xid, GuestPtrT<in_addr> in_addr_ptr) {
+  // System Link has no key exchange: the peer's IN_ADDR is the address in its XNADDR, in the
+  // same network order bytes.
+  if (!xn_addr || !in_addr_ptr) {
+    return 1;
+  }
+  in_addr_ptr->s_addr = xn_addr->ina.s_addr;
+  return 0;
 }
 
-u32 NetDll_XNetInAddrToXnAddr_entry([[maybe_unused]] u32 caller,
-                                    [[maybe_unused]] MappedVoid in_addr,
-                                    [[maybe_unused]] GuestPtrT<XNADDR> xn_addr,
-                                    [[maybe_unused]] MappedVoid xid) {
-  return 1;
+u32 NetDll_XNetInAddrToXnAddr_entry([[maybe_unused]] u32 caller, GuestPtrT<in_addr> in_addr_ptr,
+                                    GuestPtrT<XNADDR> xn_addr, [[maybe_unused]] MappedVoid xid) {
+  if (!xn_addr || !in_addr_ptr) {
+    return 1;
+  }
+  const u32 address = ntohl(in_addr_ptr->s_addr);
+  xn_addr->ina.s_addr = in_addr_ptr->s_addr;
+  xn_addr->inaOnline.s_addr = 0;
+  xn_addr->wPortOnline = 0;
+  // The peer's ethernet address is unknown: a distinct locally administered one from its IP, so
+  // peers do not share a machine id.
+  xn_addr->abEnet[0] = 0x02;
+  xn_addr->abEnet[1] = 0x00;
+  xn_addr->abEnet[2] = static_cast<u8>(address >> 24);
+  xn_addr->abEnet[3] = static_cast<u8>(address >> 16);
+  xn_addr->abEnet[4] = static_cast<u8>(address >> 8);
+  xn_addr->abEnet[5] = static_cast<u8>(address);
+  std::memset(xn_addr->abOnline, 0, 20);
+  return 0;
 }
 
 u32 NetDll_XNetSetSystemLinkPort_entry([[maybe_unused]] u32 caller, [[maybe_unused]] u32 port) {
@@ -677,7 +712,9 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry([[maybe_unused]] u32 caller) {
-  return 0;
+  // A link: 0 tells the title the cable is out, and System Link reports no network.
+  return XEthernetStatus::kXNetEthernetLinkActive | XEthernetStatus::kXNetEthernetLink100Mbps |
+         XEthernetStatus::kXNetEthernetLinkFullDuplex;
 }
 
 u32 NetDll_XNetDnsLookup_entry([[maybe_unused]] u32 caller, [[maybe_unused]] MappedString host,
@@ -711,7 +748,10 @@ u32 NetDll_XNetQosServiceLookup_entry([[maybe_unused]] u32 caller, [[maybe_unuse
   if (pqos) {
     auto qos_guest = CurrentTitle().heap.SystemHeapAlloc(sizeof(XNQOS));
     auto qos = CurrentTitle().membase.TranslateVirtual<XNQOS*>(qos_guest);
-    qos->count = qos->count_pending = 0;
+    // One finished, empty result, as bo2-bisect's app answered (it was 0 results).
+    std::memset(qos, 0, sizeof(XNQOS));
+    qos->count = 1;
+    qos->count_pending = 0;
     *pqos = qos_guest;
   }
   if (event_handle) {
@@ -733,7 +773,8 @@ u32 NetDll_XNetQosRelease_entry([[maybe_unused]] u32 caller, GuestPtrT<XNQOS> qo
 u32 NetDll_XNetQosListen_entry([[maybe_unused]] u32 caller, [[maybe_unused]] MappedVoid id,
                                [[maybe_unused]] MappedVoid data, [[maybe_unused]] u32 data_size,
                                [[maybe_unused]] u32 r7, [[maybe_unused]] u32 flags) {
-  return kernel::X_ERROR_FUNCTION_FAILED;
+  // Accepted and ignored (bo2-bisect app). There is no QoS probe traffic on System Link.
+  return 0;
 }
 
 u32 NetDll_inet_addr_entry(MappedString addr_ptr) {

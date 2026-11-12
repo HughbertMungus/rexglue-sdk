@@ -45,8 +45,9 @@ kernel::X_HRESULT XLiveBaseApp::DispatchMessageSync(u32 message, u32 buffer_ptr,
     case 0x00058007: {
       // The buffer holds dwServiceId and a pServiceInfo pointer to XONLINE_SERVICE_INFO.
       REXXAM_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
-      // XONLINE_E_LOGON_NO_NETWORK_CONNECTION
-      return 0x80151802;
+      // Success without writing, as the BO2 recompile's app answered (it was
+      // XONLINE_E_LOGON_NO_NETWORK_CONNECTION, 0x80151802).
+      return kernel::X_E_SUCCESS;
     }
     case 0x00058020: {
       REX_XAM_STUB("CXLiveFriends::Enumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
@@ -59,6 +60,12 @@ kernel::X_HRESULT XLiveBaseApp::DispatchMessageSync(u32 message, u32 buffer_ptr,
     }
     case 0x00058046: {
       REX_XAM_STUB("XLiveBaseUnk58046({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return kernel::X_E_SUCCESS;
+    }
+    case 0x0005800E: {
+      // BO2 sends this twice per frame for every remote player in a System Link lobby (believed
+      // to be XUserMuteListQuery). Unhandled, it logged an error per call and failed. Success
+      // without writing: the second argument is a pointer, and its layout is not established.
       return kernel::X_E_SUCCESS;
     }
     case 0x00058037: {

@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -60,6 +63,9 @@ class XGIApp : public rex::xam::XAMApplet {
 
  private:
   rex::xam::IAchievementManager& achievements_;
+  /** XGIUserSetContextEx values, read back by XGIUserGetContext. Key: user << 32 | context id. */
+  std::mutex contexts_mutex_;
+  std::unordered_map<u64, u32> contexts_;
 };
 
 /** XLiveBase app 0xFC, which serves online service queries such as the logon ID and NAT type. */
