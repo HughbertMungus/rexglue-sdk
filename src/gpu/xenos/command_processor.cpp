@@ -18,6 +18,9 @@
 #include <string_view>
 
 #include <format>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 
 #include <rex/bit.h>
 #include <rex/platform/perf.h>
@@ -38,6 +41,55 @@
 #include <rex/memory/stream.h>
 #include <rex/utility.h>
 #include <rex/platform/sync.h>
+
+
+namespace {
+
+// REX_FPS_LOG=1 appends one line per second to mp_fps.txt in the working folder: the guest swaps
+// (frames) of that second, measured on the command processor thread (bo2-bisect perf/0004, the
+// measurement every P2 A/B in bo2-dev uses). Off unless the variable is set.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+void FpsLogTick(bool page_clear) {
+  static const bool enabled = [] {
+    const char* value = std::getenv("REX_FPS_LOG");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (!enabled) {
+    return;
+  }
+  static std::FILE* file = std::fopen("mp_fps.txt", "a");
+  static auto window_start = std::chrono::steady_clock::now();
+  static u32 frames = 0;
+  static u64 total = 0;
+  ++frames;
+  ++total;
+  const auto now = std::chrono::steady_clock::now();
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - window_start).count();
+  if (elapsed >= 1000 && file != nullptr) {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm_local{};
+#if defined(_WIN32)
+    localtime_s(&tm_local, &t);
+#else
+    localtime_r(&t, &tm_local);
+#endif
+    std::fprintf(file, "%02d:%02d:%02d fps=%.1f frames=%u total=%llu pc=%d\n", tm_local.tm_hour,
+                 tm_local.tm_min, tm_local.tm_sec, frames * 1000.0 / static_cast<double>(elapsed),
+                 frames, static_cast<unsigned long long>(total), page_clear ? 1 : 0);
+    std::fflush(file);
+    frames = 0;
+    window_start = now;
+  }
+}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+}  // namespace
 
 namespace rex::gpu {
 
@@ -917,6 +969,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader,
   reader->AdvanceRead((count - 4) * sizeof(u32));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // pc= tags each line with gpu.xenos.clear_memory_page_state, for in-match A/B.
+  FpsLogTick(GetXenosSettings().clear_memory_page_state.Get());
   if (graphics_system_) {
     graphics_system_->NotifySwap();
   }
