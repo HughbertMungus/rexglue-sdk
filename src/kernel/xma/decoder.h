@@ -11,6 +11,12 @@
 
 #pragma once
 
+#include <vector>
+
+#include <deque>
+
+#include <condition_variable>
+
 #include <atomic>
 #include <mutex>
 #include <queue>
@@ -109,6 +115,18 @@ class XMADecoder {
   std::unique_ptr<rex::platform::Event> worker_exited_ = nullptr;
   std::jthread worker_;
 
+  // Decode pool (runtime.xma_decode_threads, bo2-bisect perf/0006): kicked contexts are decoded on
+  // persistent threads instead of inline on the guest thread that writes the kick register.
+  void DecodePoolPush(u32 context_id);
+  void DecodePoolEnsure(u32 threads);
+  void DecodePoolMain();
+  void DecodePoolStop();
+  std::vector<std::thread> pool_threads_;
+  std::mutex pool_mutex_;
+  std::condition_variable pool_cv_;
+  std::deque<u32> pool_queue_;
+  bool pool_stop_ = false;
+
   std::atomic<bool> paused_ = false;
   rex::platform::Fence pause_fence_;  /**< Signaled when the worker paused */
   rex::platform::Fence resume_fence_; /**< Signaled when resume is requested */
@@ -119,6 +137,8 @@ class XMADecoder {
 
   static const u32 kContextCount = 320;
   XMAContext contexts_[kContextCount];
+  /** A context already waiting in the decode pool is not queued again. */
+  std::atomic<bool> pool_queued_[kContextCount] = {};
   BitMap context_bitmap_;
 
   u32 context_data_first_ptr_ = 0;

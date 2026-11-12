@@ -86,6 +86,11 @@ bool XMAContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
+  // Check again under the lock: another thread (the worker sweep, an inline kick or the decode
+  // pool) may have taken this kick while this one waited, and decoding it twice corrupts state.
+  if (!IsEnabled()) {
+    return false;
+  }
   SetEnabled(false);
 
   auto context_ptr = GetAddressSpace()->TranslateVirtual(GetGuestPtr());

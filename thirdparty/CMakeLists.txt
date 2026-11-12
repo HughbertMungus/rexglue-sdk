@@ -417,6 +417,66 @@ configure_file(
   COPYONLY
 )
 
+# libavutil/mem.c with the allocation cache (ffmpeg-overlay/ffmpeg_alloc_cache.inc, switched by
+# runtime.ffmpeg_alloc_cache). Generated from the submodule's file so the submodule stays
+# pristine; an anchor that no longer matches stops the configure.
+file(READ "${FFMPEG_DIR}/libavutil/mem.c" FFMPEG_MEM_C)
+foreach (anchor
+         "#define ALIGN (HAVE_AVX512 ? 64 : (HAVE_AVX ? 32 : 16))
+"
+         "    ptr = _aligned_malloc(size, ALIGN);"
+         "    return _aligned_realloc(ptr, size + !size, ALIGN);"
+         "    _aligned_free(ptr);
+#else
+    free(ptr);")
+  string(FIND "${FFMPEG_MEM_C}" "${anchor}" anchor_pos)
+  if (anchor_pos EQUAL -1)
+    message(FATAL_ERROR "FFmpeg mem.c changed: allocation cache anchor not found: ${anchor}")
+  endif ()
+endforeach ()
+string(REPLACE "#define ALIGN (HAVE_AVX512 ? 64 : (HAVE_AVX ? 32 : 16))
+"
+               "#define ALIGN (HAVE_AVX512 ? 64 : (HAVE_AVX ? 32 : 16))
+#include \"${FFMPEG_OVERLAY_SRC_DIR}/ffmpeg_alloc_cache.inc\"
+"
+               FFMPEG_MEM_C "${FFMPEG_MEM_C}")
+string(REPLACE "    ptr = _aligned_malloc(size, ALIGN);"
+               "#ifdef FFC_ENABLED
+    ptr = ffc_alloc(size);
+#else
+    ptr = _aligned_malloc(size, ALIGN);
+#endif"
+               FFMPEG_MEM_C "${FFMPEG_MEM_C}")
+string(REPLACE "    return _aligned_realloc(ptr, size + !size, ALIGN);"
+               "#ifdef FFC_ENABLED
+    return ffc_realloc(ptr, size + !size);
+#else
+    return _aligned_realloc(ptr, size + !size, ALIGN);
+#endif"
+               FFMPEG_MEM_C "${FFMPEG_MEM_C}")
+string(REPLACE "    _aligned_free(ptr);
+#else
+    free(ptr);"
+               "#ifdef FFC_ENABLED
+    ffc_free(ptr);
+#else
+    _aligned_free(ptr);
+#endif
+#else
+    free(ptr);"
+               FFMPEG_MEM_C "${FFMPEG_MEM_C}")
+file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libavutil")
+set(FFMPEG_MEM_C_OUT "${FFMPEG_OVERLAY_BUILD_DIR}/libavutil/mem.c")
+set(FFMPEG_MEM_C_OLD "")
+if (EXISTS "${FFMPEG_MEM_C_OUT}")
+  file(READ "${FFMPEG_MEM_C_OUT}" FFMPEG_MEM_C_OLD)
+endif ()
+if (NOT FFMPEG_MEM_C_OLD STREQUAL FFMPEG_MEM_C)
+  file(WRITE "${FFMPEG_MEM_C_OUT}" "${FFMPEG_MEM_C}")
+endif ()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${FFMPEG_DIR}/libavutil/mem.c" "${FFMPEG_OVERLAY_SRC_DIR}/ffmpeg_alloc_cache.inc")
+
 # Common defines for both libraries
 set(FFMPEG_COMMON_DEFINES HAVE_AV_CONFIG_H _USE_MATH_DEFINES # For M_PI/etc
 )
@@ -483,7 +543,7 @@ add_library(
   ${FFMPEG_DIR}/libavutil/mathematics.c
   ${FFMPEG_DIR}/libavutil/mastering_display_metadata.c
   ${FFMPEG_DIR}/libavutil/md5.c
-  ${FFMPEG_DIR}/libavutil/mem.c
+  ${FFMPEG_OVERLAY_BUILD_DIR}/libavutil/mem.c
   ${FFMPEG_DIR}/libavutil/murmur3.c
   ${FFMPEG_DIR}/libavutil/opt.c
   ${FFMPEG_DIR}/libavutil/parseutils.c
@@ -544,6 +604,9 @@ target_include_directories(
 )
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w) # Suppress warnings in third-party code
+# The generated mem.c lives in the build folder; its quoted includes resolve in libavutil.
+set_source_files_properties("${FFMPEG_OVERLAY_BUILD_DIR}/libavutil/mem.c" PROPERTIES
+                            COMPILE_OPTIONS "-iquote;${FFMPEG_DIR}/libavutil")
 if (WIN32)
   target_link_libraries(libavutil PRIVATE bcrypt)
 endif ()

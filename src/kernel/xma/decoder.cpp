@@ -24,10 +24,13 @@
 #include <rex/kernel/title_runtime.h>
 #include <rex/kernel/runtime_settings.h>
 #include <rex/platform/sync.h>
+#include <rex/platform/thread.h>
 #include "kernel/settings_access.h"
 
 extern "C" {
 #include "libavutil/log.h"
+// The allocation cache in the generated libavutil/mem.c (thirdparty/ffmpeg-overlay).
+void rex_ffmpeg_alloc_cache_enable(int enabled);
 }  // extern "C"
 
 namespace rex::kernel {
@@ -126,6 +129,7 @@ void XMADecoder::WorkerThreadMain(const std::stop_token& stop) {
 
 void XMADecoder::Shutdown() {
   rex::ppc::DetachMMIO(rex::ppc::MMIOBlock::kAPU, this);
+  DecodePoolStop();
   if (!worker_.joinable()) {
     return;
   }
@@ -148,6 +152,62 @@ void XMADecoder::Shutdown() {
 
   context_data_first_ptr_ = 0;
   context_data_last_ptr_ = 0;
+}
+
+void XMADecoder::DecodePoolEnsure(u32 threads) {
+  threads = std::min<u32>(threads, 8);
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+  while (pool_threads_.size() < threads && !pool_stop_) {
+    pool_threads_.emplace_back([this]() {
+      rex::platform::SetCurrentThreadName("XMA Decode Pool");
+      DecodePoolMain();
+    });
+  }
+}
+
+void XMADecoder::DecodePoolPush(u32 context_id) {
+  if (pool_queued_[context_id].exchange(true)) {
+    return;  // Already waiting; its Work() sees the new state.
+  }
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    pool_queue_.push_back(context_id);
+  }
+  pool_cv_.notify_one();
+}
+
+void XMADecoder::DecodePoolMain() {
+  while (true) {
+    u32 context_id;
+    {
+      std::unique_lock<std::mutex> lock(pool_mutex_);
+      pool_cv_.wait(lock, [this]() { return pool_stop_ || !pool_queue_.empty(); });
+      if (pool_queue_.empty()) {
+        return;  // Stopping with nothing left.
+      }
+      context_id = pool_queue_.front();
+      pool_queue_.pop_front();
+    }
+    pool_queued_[context_id] = false;
+    auto& context = contexts_[context_id];
+    if (context.Work()) {
+      context.SignalWorkDone();
+    }
+  }
+}
+
+void XMADecoder::DecodePoolStop() {
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    pool_stop_ = true;
+  }
+  pool_cv_.notify_all();
+  for (std::thread& thread : pool_threads_) {
+    if (thread.joinable()) {
+      thread.join();  // The threads drain the queue first.
+    }
+  }
+  pool_threads_.clear();
 }
 
 int XMADecoder::GetContextID(u32 context_ptr) const {
@@ -257,10 +317,21 @@ void XMADecoder::WriteRegister(u32 addr, u32 value) {
         context.Enable();
       }
     }
+    rex_ffmpeg_alloc_cache_enable(GetRuntimeSettings().ffmpeg_alloc_cache.Get() ? 1 : 0);
+    const u32 pool_threads = GetRuntimeSettings().xma_decode_threads.Get();
+    if (pool_threads > 0) {
+      // Hand the decode to the pool, so the guest thread returns at once; a stun grenade's audio
+      // otherwise put several ms of FFmpeg per frame on a game thread (bo2-bisect perf/0006).
+      DecodePoolEnsure(pool_threads);
+    }
     // Decode inline, a worker sweep would stall the audio thread 50 to 100ms in kick bursts.
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
         u32 context_id = base_context_id + i;
+        if (pool_threads > 0) {
+          DecodePoolPush(context_id);
+          continue;
+        }
         auto& context = contexts_[context_id];
         if (context.Work()) {
           context.SignalWorkDone();

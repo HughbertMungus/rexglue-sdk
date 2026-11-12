@@ -30,6 +30,13 @@ class REX_KERNEL_API RuntimeSettings final : public SettingOwner {
   REX_SETTING(bool, ignore_thread_priorities, true, "Ignore guest thread priorities");
   REX_SETTING(bool, ignore_thread_affinities, true, "Ignore guest thread affinities");
   REX_SETTING(bool, ffmpeg_verbose, false, "Log FFmpeg messages for XMA decoding");
+  REX_SETTING(u32, xma_decode_threads, 0,
+              "Threads that decode kicked XMA contexts, 0 decodes inline on the guest thread "
+              "that kicks them",
+              Range{0, 8});
+  REX_SETTING(bool, ffmpeg_alloc_cache, false,
+              "Reuse FFmpeg's freed allocations of 64 B to 64 KB instead of returning them to "
+              "the heap (Windows)");
   REX_SETTING(u32, terminate_timeout_ms, 2000, "Time Unload waits for guest threads to exit",
               Range{0, 60000});
 
