@@ -40,6 +40,7 @@
 #include <rex/filesystem/mount.h>
 #include <rex/filesystem/file_system.h>
 #include <rex/filesystem/xdbf.h>
+#include <rex/kernel/guest_allocator.h>
 #include <rex/kernel/guest_memory.h>
 #include <rex/kernel/title_runtime.h>
 #include <rex/kernel/kernel_settings.h>
@@ -291,6 +292,9 @@ class TitleState : public ITitleExit, public ITitleDebugOutput, public rex::NonC
 
   kernel::WorkspaceHeap& GetWorkspace();
 
+  /** The title workspace that stays valid when CreateWorkspace replaces the heap. */
+  kernel::ITitleWorkspace& GetWorkspaceView();
+
   kernel::IModuleRegistry& GetModuleRegistry();
 
   kernel::INotificationBroadcaster& GetNotificationBroadcaster();
@@ -451,6 +455,22 @@ class TitleState : public ITitleExit, public ITitleDebugOutput, public rex::NonC
   std::unique_ptr<TitleContext> title_context_;
   std::unique_ptr<kernel::Dispatcher> dispatcher_;
   std::unique_ptr<kernel::WorkspaceHeap> workspace_;
+  /**
+   * The workspace that XAM and GetGuestWorkspace hand out. CreateWorkspace replaces workspace_
+   * when the XEX declares its own workspace size, after XAM was attached with the default one, so
+   * a reference to *workspace_ would dangle (XamAlloc then calls through freed memory). This
+   * forwards to whichever WorkspaceHeap is current.
+   */
+  class WorkspaceView final : public kernel::ITitleWorkspace {
+   public:
+    explicit WorkspaceView(const std::unique_ptr<kernel::WorkspaceHeap>& heap) : heap_(heap) {}
+    [[nodiscard]] Result<u32> Allocate(u32 size, bool zero) override;
+    void Free(u32 address) override;
+
+   private:
+    const std::unique_ptr<kernel::WorkspaceHeap>& heap_;
+  };
+  WorkspaceView workspace_view_{workspace_};
   u32 kernel_guest_globals_ = 0;
   std::atomic<bool> terminating_title_{false};
   std::atomic<bool> terminate_claimed_{false};

@@ -130,7 +130,7 @@ kernel::IThreadRegistry& TitleRuntime::GetThreadRegistry() {
 }
 
 kernel::ITitleWorkspace& TitleRuntime::GetGuestWorkspace() {
-  return state_->GetWorkspace();
+  return state_->GetWorkspaceView();
 }
 
 kernel::ISystemHeap& TitleRuntime::GetGuestHeap() {
