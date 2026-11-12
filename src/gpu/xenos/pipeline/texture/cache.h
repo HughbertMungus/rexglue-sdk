@@ -184,6 +184,7 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
     TextureCache& GetTextureCache() const { return texture_cache_; }
 
     const TextureKey& GetKey() const { return key_; }
+    u64 GetHostMemoryUsage() const { return host_memory_usage_; }
 
     const xenos::GuestTextureLayout& GetGuestLayout() const { return guest_layout_; }
     u32 GetGuestBaseSize() const { return GetGuestLayout().base.level_data_extent_bytes; }
@@ -522,6 +523,12 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
 
   /** Set by a memory watch, forcing a recheck of textures regardless of fetch constant changes. */
   std::atomic<bool> texture_became_outdated_{false};
+
+  /**
+   * Called for a texture evicted by CompletedSubmissionUpdated (its last GPU use has completed)
+   * right before it is destroyed, so a driver can keep the host resource for reuse.
+   */
+  virtual void OnTextureEvicted([[maybe_unused]] Texture& texture) {}
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   u32 texture_bindings_in_sync_ = 0;

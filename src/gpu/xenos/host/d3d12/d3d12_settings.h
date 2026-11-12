@@ -43,6 +43,10 @@ class D3D12Settings : public SettingOwner {
               "At frame start, upload again in one batch the parts of the ranges uploaded on demand "
               "in this many previous frames that are invalid again, 0 turns it off",
               Range{0, 7});
+  REX_SETTING(i32, texture_recycle_pool_mb, 0,
+              "Keep evicted texture resources up to this many MB for reuse by textures of the same "
+              "description, instead of creating and destroying them, 0 turns it off",
+              Range{0, 2048});
   REX_SETTING(bool, fetch_dedup, false,
               "Skip texture rebinds and the fetch constant buffer update for fetch constant writes "
               "that do not change the value");

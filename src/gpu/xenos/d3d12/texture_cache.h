@@ -14,6 +14,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <list>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -258,6 +259,48 @@ class D3D12TextureCache final : public TextureCache {
     u32 swizzle;
   };
 
+  // Texture resource recycling (gpu.d3d12.texture_recycle_pool_mb, bo2-bisect perf/0024):
+  // evicted resources wait for reuse by textures of the same description, oldest released first.
+  struct RecycleKey {
+    u64 width;
+    u32 height;
+    u16 depth_or_array_size;
+    u16 mip_levels;
+    u32 format;
+    u32 dimension;
+    bool operator==(const RecycleKey& o) const = default;
+    struct Hasher {
+      size_t operator()(const RecycleKey& k) const {
+        u64 h = k.width * 0x9E3779B97F4A7C15ull ^ (u64{k.height} << 20) ^
+                (u64{k.depth_or_array_size} << 40) ^ (u64{k.mip_levels} << 52) ^
+                (u64{k.format} << 8) ^ k.dimension;
+        return static_cast<size_t>(h ^ (h >> 29));
+      }
+    };
+    static RecycleKey FromDesc(const D3D12_RESOURCE_DESC& d) {
+      return RecycleKey{d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.MipLevels,
+                        static_cast<u32>(d.Format),
+                        static_cast<u32>(d.Dimension)};
+    }
+  };
+  struct RecycledResource {
+    RecycleKey key;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_STATES state;
+    u64 size;
+  };
+  void OnTextureEvicted(Texture& texture) override;
+  void TrimRecyclePool(u64 limit_bytes);
+  /** Front is the oldest. */
+  std::list<RecycledResource> recycle_lru_;
+  std::unordered_map<RecycleKey, std::vector<std::list<RecycledResource>::iterator>,
+                     RecycleKey::Hasher>
+      recycle_by_key_;
+  u64 recycle_bytes_ = 0;
+
   class D3D12Texture final : public Texture {
    public:
     union SRVDescriptorKey {
@@ -276,6 +319,11 @@ class D3D12TextureCache final : public TextureCache {
     };
 
     ID3D12Resource* GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATES end_state);
+    /** Hands the resource to the recycling pool; the texture is about to be destroyed. */
+    Microsoft::WRL::ComPtr<ID3D12Resource> TakeResource(D3D12_RESOURCE_STATES& state_out) {
+      state_out = resource_state_;
+      return std::move(resource_);
+    }
     /**
      * Copies slice 0 of level 0 into the 3D as 2D wrapper when level 0 was reloaded since the
      * last copy (bo2-bisect fix/0001).

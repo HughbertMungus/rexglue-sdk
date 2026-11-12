@@ -606,6 +606,7 @@ bool D3D12TextureCache::Initialize() {
 
 void D3D12TextureCache::ClearCache() {
   TextureCache::ClearCache();
+  TrimRecyclePool(0);
 
   srv_descriptor_cache_free_.clear();
   srv_descriptor_cache_free_count_ = 0;
@@ -1465,12 +1466,73 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   ID3D12Device* device = provider.GetDevice();
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(&gpu::d3d12::objects::kHeapPropertiesDefault,
+  // Reuse an evicted resource of the same description when the pool has one.
+  if (!recycle_lru_.empty()) {
+    auto it = recycle_by_key_.find(RecycleKey::FromDesc(desc));
+    if (it != recycle_by_key_.end() && !it->second.empty()) {
+      auto entry = it->second.back();
+      it->second.pop_back();
+      resource = std::move(entry->resource);
+      resource_state = entry->state;
+      recycle_bytes_ -= entry->size;
+      recycle_lru_.erase(entry);
+    }
+  }
+  if (!resource &&
+      FAILED(device->CreateCommittedResource(&gpu::d3d12::objects::kHeapPropertiesDefault,
                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
   return std::make_unique<D3D12Texture>(*this, key, resource.Get(), resource_state);
+}
+
+void D3D12TextureCache::OnTextureEvicted(Texture& texture) {
+  const u64 limit =
+      static_cast<u64>(command_processor_.GetD3D12Settings().texture_recycle_pool_mb.Get()) << 20;
+  if (!limit) {
+    if (!recycle_lru_.empty()) {
+      TrimRecyclePool(0);
+    }
+    return;
+  }
+  D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  if (!d3d12_texture.GetResource()) {
+    return;
+  }
+  const u64 size = texture.GetHostMemoryUsage();
+  if (size > limit / 4) {
+    return;
+  }
+  D3D12_RESOURCE_STATES state;
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource = d3d12_texture.TakeResource(state);
+  const RecycleKey key = RecycleKey::FromDesc(resource->GetDesc());
+  recycle_lru_.push_back(RecycledResource{key, std::move(resource), state, size});
+  recycle_by_key_[key].push_back(std::prev(recycle_lru_.end()));
+  recycle_bytes_ += size;
+  TrimRecyclePool(limit);
+}
+
+void D3D12TextureCache::TrimRecyclePool(u64 limit_bytes) {
+  while (recycle_bytes_ > limit_bytes && !recycle_lru_.empty()) {
+    auto oldest = recycle_lru_.begin();
+    auto map_it = recycle_by_key_.find(oldest->key);
+    if (map_it != recycle_by_key_.end()) {
+      auto& entries = map_it->second;
+      // A key's oldest entry is near the front of its vector (pushed in eviction order).
+      for (auto v = entries.begin(); v != entries.end(); ++v) {
+        if (*v == oldest) {
+          entries.erase(v);
+          break;
+        }
+      }
+      if (entries.empty()) {
+        recycle_by_key_.erase(map_it);
+      }
+    }
+    recycle_bytes_ -= oldest->size;
+    recycle_lru_.erase(oldest);
+  }
 }
 
 bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, bool load_base,

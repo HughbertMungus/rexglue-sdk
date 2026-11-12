@@ -112,6 +112,7 @@ void TextureCache::CompletedSubmissionUpdated(u64 completed_submission_index) {
       // Bindings may reference the destroyed texture, so reset them.
       ResetTextureBindings();
     }
+    OnTextureEvicted(*texture);
     auto found_texture_it = textures_.find(texture->GetKey());
     REX_ASSERT(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
