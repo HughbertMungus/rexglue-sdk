@@ -12,6 +12,9 @@
 #pragma once
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <deque>
@@ -70,6 +73,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   }
 
   u64 GetCurrentSubmission() const { return submission_current_; }
+
+  /**
+   * With gpu.d3d12.async_replay, closed submissions are recorded into the D3D12 command list,
+   * executed and signaled by the GPU Replay thread. Anything that puts work on the direct queue
+   * directly (not through a submission) calls this first to keep queue order.
+   */
+  void FlushAsyncReplay();
   u64 GetCompletedSubmission() const { return submission_completed_; }
 
   /**
@@ -230,6 +240,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   void IssueSwap(u32 frontbuffer_ptr, u32 frontbuffer_width, u32 frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void SyncGuestVisible() override;
+  /** Adds rp= async replay, uw= upload copy workers, pf= upload prefetch frames. */
+  std::string FpsLogTags() const override {
+    return CommandProcessor::FpsLogTags() +
+           " rp=" + std::to_string(GetD3D12Settings().async_replay.Get() ? 1 : 0) +
+           " uw=" + std::to_string(GetD3D12Settings().upload_copy_workers.Get()) +
+           " pf=" + std::to_string(GetD3D12Settings().upload_prefetch_frames.Get());
+  }
 
   Shader* LoadShader(xenos::ShaderType shader_type, u32 guest_address, const u32* host_address,
                      u32 dword_count) override;
@@ -445,6 +463,36 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // Async replay (gpu.d3d12.async_replay, bo2-bisect perf/0012).
+  struct ReplayJob {
+    /** Submission replay: list + allocator, signals submission_fence_ with `value`. */
+    DeferredCommandList* list = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    /** A fence only job when list is null (fence AddRef'd by the producer). */
+    ID3D12Fence* fence = nullptr;
+    UINT64 value = 0;
+    /** Shared memory upload copies to finish before the list executes. */
+    u64 upload_ticket = 0;
+  };
+  void ReplayThreadMain();
+  void ReplayEnqueue(const ReplayJob& job);
+  void StartAsyncReplay();
+  void StopAsyncReplay();
+  /** The replay thread runs. */
+  bool replay_async_ = false;
+  /** Current submissions go through it (follows the setting at each submission end). */
+  bool replay_active_ = false;
+  bool replay_presenter_hooked_ = false;
+  std::thread replay_thread_;
+  std::mutex replay_mutex_;
+  std::condition_variable replay_cv_;
+  std::deque<ReplayJob> replay_queue_;
+  bool replay_busy_ = false;
+  bool replay_shutdown_ = false;
+  /** Free lists, owned by replay_lists_all_. */
+  std::vector<DeferredCommandList*> replay_lists_free_;
+  std::vector<std::unique_ptr<DeferredCommandList>> replay_lists_all_;
 
   bool debug_markers_enabled_ = false;
 

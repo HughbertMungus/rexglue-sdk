@@ -278,13 +278,23 @@ Presenter::PaintResult D3D12Presenter::DriverPaintAndPresent(bool execute_ui_dra
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  UINT64 guest_output_refresh_value = 0;
   {
     u32 guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+      guest_output_refresh_value = guest_output_resources_[guest_output_mailbox_index].first;
     }
+  }
+  if (guest_output_resource && guest_output_queue_tracking_.load(std::memory_order_relaxed)) {
+    // Async replay: don't put this paint on the queue before the refresh that wrote the texture.
+    // The timeout only guards against a stopped replay thread.
+    std::unique_lock<std::mutex> lock(guest_output_queued_mutex_);
+    guest_output_queued_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] {
+      return guest_output_queued_ >= guest_output_refresh_value;
+    });
   }
 
   if (guest_output_resource) {

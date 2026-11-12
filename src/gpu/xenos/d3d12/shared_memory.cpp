@@ -9,13 +9,16 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include "gpu/xenos/d3d12/command_processor.h"
 #include "gpu/xenos/d3d12/shared_memory.h"
+#include <rex/platform/thread.h>
 #include "gpu/xenos/physical_memory.h"
 #include <rex/logging/log_category.h>
 #include <rex/math.h>
@@ -28,7 +31,112 @@ D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
     : SharedMemory(memory, watch), command_processor_(command_processor) {}
 
 D3D12SharedMemory::~D3D12SharedMemory() {
+  StopCopyThreads();
   Shutdown(true);
+}
+
+void D3D12SharedMemory::CopyThreadMain(int index) {
+  rex::platform::SetCurrentThreadName("GPU Upload Copy " + std::to_string(index));
+  while (true) {
+    CopyJob job;
+    {
+      std::unique_lock<std::mutex> lock(copy_mutex_);
+      copy_worker_cvs_[index].wait(lock, [this, index]() {
+        return copy_stop_ || (index < copy_workers_active_.load(std::memory_order_relaxed) &&
+                              !copy_queue_.empty());
+      });
+      if (copy_queue_.empty()) {
+        if (copy_stop_) {
+          return;
+        }
+        continue;
+      }
+      job = copy_queue_.front();
+      copy_queue_.pop_front();
+    }
+    std::memcpy(job.dst, job.src, job.size);
+    {
+      std::lock_guard<std::mutex> lock(copy_mutex_);
+      FinishCopyLocked(job.seq);
+    }
+    copy_done_cv_.notify_all();
+  }
+}
+
+void D3D12SharedMemory::FinishCopyLocked(u64 seq) {
+  copy_done_[seq % kCopyDoneRing] = 1;
+  while (copy_done_[copy_prefix_ % kCopyDoneRing]) {
+    copy_done_[copy_prefix_ % kCopyDoneRing] = 0;
+    ++copy_prefix_;
+  }
+  copy_completed_.store(copy_prefix_, std::memory_order_release);
+}
+
+void D3D12SharedMemory::WaitForUploads(u64 ticket) {
+  if (copy_completed_.load(std::memory_order_acquire) >= ticket) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(copy_mutex_);
+  while (copy_completed_.load(std::memory_order_acquire) < ticket) {
+    if (!copy_queue_.empty()) {
+      // Do queued copies here instead of idling until a worker gets to them.
+      CopyJob job = copy_queue_.front();
+      copy_queue_.pop_front();
+      lock.unlock();
+      std::memcpy(job.dst, job.src, job.size);
+      lock.lock();
+      FinishCopyLocked(job.seq);
+      copy_done_cv_.notify_all();
+      continue;
+    }
+    copy_done_cv_.wait(lock);
+  }
+}
+
+void D3D12SharedMemory::StopCopyThreads() {
+  bool any = false;
+  for (std::thread& t : copy_threads_) {
+    any = any || t.joinable();
+  }
+  if (!any) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(copy_mutex_);
+    copy_stop_ = true;
+  }
+  for (std::condition_variable& cv : copy_worker_cvs_) {
+    cv.notify_all();
+  }
+  for (std::thread& t : copy_threads_) {
+    if (t.joinable()) {
+      t.join();  // The workers drain the queue first.
+    }
+  }
+  copy_stop_ = false;
+}
+
+void D3D12SharedMemory::PrefetchHotRanges() {
+  hot_frame_ = (hot_frame_ + 1) % kHotFrames;
+  hot_ranges_[hot_frame_].clear();  // The oldest frame's ranges age out.
+  const int frames = command_processor_.GetD3D12Settings().upload_prefetch_frames.Get();
+  if (frames <= 0) {
+    return;
+  }
+  std::vector<std::pair<u32, u32>> ranges;
+  const size_t window = std::clamp<size_t>(static_cast<size_t>(frames), 1, kHotFrames - 1);
+  for (size_t back = 1; back <= window; ++back) {
+    const size_t f = (hot_frame_ + kHotFrames - back) % kHotFrames;
+    for (const auto& r : hot_ranges_[f]) {
+      ranges.emplace_back(r.first << GetPageSizeLog2(), r.second << GetPageSizeLog2());
+    }
+  }
+  if (ranges.empty()) {
+    return;
+  }
+  prefetching_ = true;
+  RequestRanges(ranges.data(), ranges.size());
+  prefetching_ = false;
 }
 
 bool D3D12SharedMemory::Initialize() {
@@ -138,6 +246,7 @@ bool D3D12SharedMemory::Initialize() {
 }
 
 void D3D12SharedMemory::Shutdown(bool from_destructor) {
+  WaitForUploads(copy_enqueued_);  // No copy into buffers about to be released.
   upload_buffer_pool_.reset();
 
   gpu::d3d12::objects::ReleaseAndNull(buffer_descriptor_heap_);
@@ -286,6 +395,7 @@ bool D3D12SharedMemory::AllocateSparseHostGPUMemoryRange(u32 offset_allocations,
   region_size.UseBox = FALSE;
   D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
   UINT heap_range_start_offset = 0;
+  command_processor_.FlushAsyncReplay();  // keep queue order with async replay
   direct_queue->UpdateTileMappings(buffer_, 1, &region_start_coordinates, &region_size, heap, 1,
                                    &range_flags, &heap_range_start_offset, &region_size.NumTiles,
                                    D3D12_TILE_MAPPING_FLAG_NONE);
@@ -296,6 +406,18 @@ bool D3D12SharedMemory::AllocateSparseHostGPUMemoryRange(u32 offset_allocations,
 bool D3D12SharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
     return true;
+  }
+  if (!prefetching_) {
+    // Demand uploads feed the next frames' prefetch.
+    auto& hot = hot_ranges_[hot_frame_];
+    hot.insert(hot.end(), upload_page_ranges.begin(), upload_page_ranges.end());
+  }
+  const int workers = command_processor_.GetD3D12Settings().upload_copy_workers.Get();
+  copy_workers_active_.store(workers, std::memory_order_relaxed);
+  for (int w = 0; w < workers; ++w) {
+    if (!copy_threads_[w].joinable()) {
+      copy_threads_[w] = std::thread(&D3D12SharedMemory::CopyThreadMain, this, w);
+    }
   }
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
@@ -321,7 +443,25 @@ bool D3D12SharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& upl
       if (!upload_source) {
         return false;
       }
-      std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
+      if (workers > 0) {
+        // The pages are write watched already (MarkRangeValid above), so copying a little later
+        // is equivalent to copying now: a write in between invalidates them and they are uploaded
+        // again on the next request. The GPU reads the upload buffer only once the submission's
+        // command list executes, which waits for this copy's ticket.
+        if (copy_enqueued_ - copy_completed_.load(std::memory_order_acquire) >=
+            kCopyDoneRing - 1) {
+          WaitForUploads(copy_enqueued_ - kCopyDoneRing / 2);  // Keep the ring from wrapping.
+        }
+        {
+          std::lock_guard<std::mutex> lock(copy_mutex_);
+          copy_queue_.push_back(
+              CopyJob{upload_buffer_mapping, upload_source, upload_buffer_size, copy_enqueued_});
+          ++copy_enqueued_;
+        }
+        copy_worker_cvs_[copy_wake_next_++ % static_cast<u32>(workers)].notify_one();
+      } else {
+        std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
+      }
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << GetPageSizeLog2(),
                                        upload_buffer, static_cast<UINT64>(upload_buffer_offset),
                                        static_cast<UINT64>(upload_buffer_size));

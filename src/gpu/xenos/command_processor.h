@@ -267,6 +267,20 @@ class REX_GPU_XENOS_API CommandProcessor : public rex::NonCopyable {
 
   u32 ExecutePrimaryBuffer(u32 start_index, u32 end_index);
   virtual void OnPrimaryBufferEnd() {}
+
+  /**
+   * Called right before the command processor makes progress visible to the guest: fence and
+   * event memory writes, scratch and read pointer writeback, interrupts. Work the guest may treat
+   * as finished from then on, such as upload copies of buffers it will refill, must be done here
+   * (bo2-bisect perf/0030). D3D12 waits for its queued upload copies.
+   */
+  virtual void SyncGuestVisible() {}
+
+  /**
+   * The switches tagged on each REX_FPS_LOG line: pc= page clear, iw= CPU write invalidation
+   * width (log2 pages). Drivers append their own.
+   */
+  virtual std::string FpsLogTags() const;
   void ExecuteIndirectBuffer(u32 ptr, u32 length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, u32 packet);

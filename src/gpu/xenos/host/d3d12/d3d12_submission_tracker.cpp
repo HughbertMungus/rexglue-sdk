@@ -79,7 +79,11 @@ bool D3D12SubmissionTracker::TrySignalEnqueueing() {
   if (!queue_ || !fence_) {
     return false;
   }
-  if (FAILED(queue_->Signal(fence_.Get(), submission_current_ - 1))) {
+  if (signal_override_) {
+    if (!signal_override_(fence_.Get(), submission_current_ - 1)) {
+      return false;
+    }
+  } else if (FAILED(queue_->Signal(fence_.Get(), submission_current_ - 1))) {
     return false;
   }
   submission_signal_queued_ = submission_current_ - 1;

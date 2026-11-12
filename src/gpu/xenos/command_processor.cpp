@@ -27,6 +27,7 @@
 #include <rex/logging/log_category.h>
 #include <rex/chrono.h>
 #include "gpu/xenos/command_processor.h"
+#include "gpu/xenos/xenos_settings.h"
 #include "gpu/xenos/xenos_graphics_driver_base.h"
 #include "gpu/xenos/physical_memory.h"
 #include <rex/xenos/texture.h>
@@ -52,7 +53,7 @@ namespace {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-void FpsLogTick(bool page_clear) {
+void FpsLogTick(const std::string& tags) {
   static const bool enabled = [] {
     const char* value = std::getenv("REX_FPS_LOG");
     return value != nullptr && value[0] == '1';
@@ -77,9 +78,9 @@ void FpsLogTick(bool page_clear) {
 #else
     localtime_r(&t, &tm_local);
 #endif
-    std::fprintf(file, "%02d:%02d:%02d fps=%.1f frames=%u total=%llu pc=%d\n", tm_local.tm_hour,
+    std::fprintf(file, "%02d:%02d:%02d fps=%.1f frames=%u total=%llu %s\n", tm_local.tm_hour,
                  tm_local.tm_min, tm_local.tm_sec, frames * 1000.0 / static_cast<double>(elapsed),
-                 frames, static_cast<unsigned long long>(total), page_clear ? 1 : 0);
+                 frames, static_cast<unsigned long long>(total), tags.c_str());
     std::fflush(file);
     frames = 0;
     window_start = now;
@@ -346,6 +347,7 @@ void CommandProcessor::WorkerThreadMain() {
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
     if (read_ptr_writeback_ptr_) {
+      SyncGuestVisible();  // queued upload copies first (async upload copies)
       StoreReleaseHost(physical_memory_, read_ptr_writeback_ptr_, read_ptr_index_);
     }
   }
@@ -412,6 +414,7 @@ void CommandProcessor::WriteRegister(u32 index, u32 value) {
     if ((1 << scratch_reg) & regs.values[std::to_underlying(xenos::Register::SCRATCH_UMSK)]) {
       u32 scratch_addr = regs.values[std::to_underlying(xenos::Register::SCRATCH_ADDR)];
       u32 mem_addr = scratch_addr + (scratch_reg * 4);
+      SyncGuestVisible();  // queued upload copies first (async upload copies)
       StoreReleaseHost(physical_memory_, mem_addr, value);
     }
   } else {
@@ -925,12 +928,18 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader,
   return true;
 }
 
+std::string CommandProcessor::FpsLogTags() const {
+  return "pc=" + std::to_string(GetXenosSettings().clear_memory_page_state.Get() ? 1 : 0) +
+         " iw=" + std::to_string(GetXenosSettings().cpu_write_invalidation_pages_log2.Get());
+}
+
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
                                                     [[maybe_unused]] u32 packet,
                                                     [[maybe_unused]] u32 count) {
   REX_PROFILE_SCOPE("gpu");
 
   u32 cpu_mask = reader->ReadAndSwap<u32>();
+  SyncGuestVisible();  // queued upload copies first (async upload copies)
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -969,8 +978,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader,
   reader->AdvanceRead((count - 4) * sizeof(u32));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-  // pc= tags each line with gpu.xenos.clear_memory_page_state, for in-match A/B.
-  FpsLogTick(GetXenosSettings().clear_memory_page_state.Get());
+  // Each line is tagged with the switches in effect (FpsLogTags), for in-match A/B.
+  FpsLogTick(FpsLogTags());
   if (graphics_system_) {
     graphics_system_->NotifySwap();
   }
@@ -1117,6 +1126,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GPUSwap(reg_val, endianness);
+  SyncGuestVisible();  // queued upload copies first (async upload copies)
   StoreRelease(physical_memory_, mem_addr, reg_val);
 
   return true;
@@ -1131,6 +1141,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader,
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GPUSwap(write_data, endianness);
+    SyncGuestVisible();  // queued upload copies first (async upload copies)
     StoreRelease(physical_memory_, addr, write_data);
     write_addr += 4;
   }
@@ -1192,6 +1203,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GPUSwap(write_data, endianness);
+      SyncGuestVisible();  // queued upload copies first (async upload copies)
       StoreRelease(physical_memory_, write_reg_addr, write_data);
     } else {
       WriteRegister(write_reg_addr, write_data);
@@ -1229,6 +1241,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GPUSwap(data_value, endianness);
+  SyncGuestVisible();  // queued upload copies first (async upload copies)
   StoreRelease(physical_memory_, address, data_value);
   return true;
 }

@@ -12,6 +12,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <memory>
 #include <utility>
 
@@ -56,6 +61,32 @@ class D3D12Presenter final : public Presenter {
   static constexpr DXGI_FORMAT kGuestOutputFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
   static constexpr D3D12_RESOURCE_STATES kGuestOutputInternalState =
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+  /**
+   * Async replay (gpu.d3d12.async_replay): routes the guest output refresher's fence signals
+   * through the producer's ordered queue path; an empty function restores direct signaling.
+   */
+  void SetGuestOutputRefresherSignalOverride(
+      std::function<bool(ID3D12Fence* fence, UINT64 value)> signal_override) {
+    guest_output_queue_tracking_.store(static_cast<bool>(signal_override),
+                                       std::memory_order_relaxed);
+    guest_output_resource_refresher_submission_tracker_.SetSignalOverride(
+        std::move(signal_override));
+  }
+
+  /**
+   * Called by the replay thread once a refresher signal is on the queue. With async replay a
+   * refreshed guest output is published before its commands reach the queue; painting waits for
+   * its texture's value, so it never draws an older frame from the mailbox (bo2-bisect perf/0054:
+   * that showed up as tearing and out of order frames).
+   */
+  void NoteGuestOutputQueued(UINT64 value) {
+    {
+      std::lock_guard<std::mutex> lock(guest_output_queued_mutex_);
+      if (value > guest_output_queued_) guest_output_queued_ = value;
+    }
+    guest_output_queued_cv_.notify_all();
+  }
 
   /** Format used internally by Windows composition. */
   static constexpr DXGI_FORMAT kSwapChainFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -231,6 +262,10 @@ class D3D12Presenter final : public Presenter {
   std::array<std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>, kGuestOutputMailboxSize>
       guest_output_resources_;
   D3D12SubmissionTracker guest_output_resource_refresher_submission_tracker_;
+  std::mutex guest_output_queued_mutex_;
+  std::condition_variable guest_output_queued_cv_;
+  UINT64 guest_output_queued_ = 0;
+  std::atomic<bool> guest_output_queue_tracking_{false};
 
   /** Submission tracker whose indices go to UI drawers, accessed from the UI thread only. */
   D3D12SubmissionTracker ui_submission_tracker_;

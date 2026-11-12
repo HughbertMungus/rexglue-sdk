@@ -500,6 +500,12 @@ PhysicalRange SharedMemory::OnPhysicalWrite(PhysicalRange range, bool exact_rang
       page_last = (page_last & ~static_cast<u32>(63)) +
                   (std::max(rex::tzcnt(gpu_written_end), static_cast<u8>(1)) - 1);
     }
+    // Limit the widening to the aligned page group of gpu.xenos.cpu_write_invalidation_pages_log2
+    // around the written pages (6 = the whole 64 page block, as before).
+    const u32 group = static_cast<u32>(1)
+                      << invalidation_width_log2_.load(std::memory_order_relaxed);
+    page_first = std::max(page_first, (physical_address_start >> page_size_log2_) & ~(group - 1));
+    page_last = std::min(page_last, (physical_address_last >> page_size_log2_) | (group - 1));
   }
 
   for (u32 i = block_first; i <= block_last; ++i) {

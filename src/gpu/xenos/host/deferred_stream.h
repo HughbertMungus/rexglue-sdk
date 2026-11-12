@@ -41,6 +41,8 @@ class DeferredStream {
 
   /** Discards every command and keeps the capacity. */
   void Clear() { stream_.clear(); }
+  /** Exchanges the contents with another stream in O(1). */
+  void swap(DeferredStream& other) noexcept { stream_.swap(other.stream_); }
 
   const uintmax_t* Data() const { return stream_.data(); }
 

@@ -12,7 +12,12 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -34,6 +39,24 @@ class D3D12SharedMemory : public SharedMemory {
   bool Initialize();
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+
+  // Async upload copies (gpu.d3d12.upload_copy_workers, bo2-bisect perf/0027, 0032, 0041). The
+  // ticket is the number of copies queued so far (command thread); WaitForUploads(ticket) returns
+  // once all of them are done, which a command list reading the upload buffers and every
+  // guest-visible write need first. Waiters copy queued jobs themselves instead of idling.
+  u64 UploadTicket() const { return copy_enqueued_; }
+  bool UploadsDone(u64 ticket) const {
+    return copy_completed_.load(std::memory_order_acquire) >= ticket;
+  }
+  void WaitForUploads(u64 ticket);
+
+  /**
+   * Frame start (gpu.d3d12.upload_prefetch_frames, bo2-bisect perf/0029, 0042): uploads again in
+   * one batch, with one buffer transition, the parts of the ranges uploaded on demand in the last
+   * frames that are invalid again, so the frame's draws find them valid instead of each forcing a
+   * copy destination transition mid frame.
+   */
+  void PrefetchHotRanges();
 
   ID3D12Resource* GetBuffer() const { return buffer_; }
   D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const { return buffer_gpu_address_; }
@@ -85,6 +108,37 @@ class D3D12SharedMemory : public SharedMemory {
 
  private:
   D3D12CommandProcessor& command_processor_;
+
+  struct CopyJob {
+    void* dst;
+    const void* src;
+    size_t size;
+    u64 seq;
+  };
+  /** Jobs may finish out of order; copy_completed_ is the contiguous finished prefix. */
+  static constexpr u64 kCopyDoneRing = u64{1} << 16;
+  std::vector<u8> copy_done_ = std::vector<u8>(kCopyDoneRing, 0);
+  u64 copy_prefix_ = 0;  // Guarded by copy_mutex_.
+  void FinishCopyLocked(u64 seq);
+  void CopyThreadMain(int index);
+  void StopCopyThreads();
+  static constexpr int kMaxCopyThreads = 4;
+  std::thread copy_threads_[kMaxCopyThreads];
+  std::condition_variable copy_worker_cvs_[kMaxCopyThreads];
+  std::atomic<int> copy_workers_active_{0};
+  u32 copy_wake_next_ = 0;
+  std::mutex copy_mutex_;
+  std::condition_variable copy_done_cv_;
+  std::deque<CopyJob> copy_queue_;
+  bool copy_stop_ = false;
+  u64 copy_enqueued_ = 0;  // Command thread only.
+  std::atomic<u64> copy_completed_{0};
+
+  static constexpr size_t kHotFrames = 8;
+  /** Pages (first, count) uploaded on demand per frame, a ring over kHotFrames frames. */
+  std::vector<std::pair<u32, u32>> hot_ranges_[kHotFrames];
+  size_t hot_frame_ = 0;
+  bool prefetching_ = false;
 
   /** The 512 MB tiled buffer. */
   ID3D12Resource* buffer_ = nullptr;

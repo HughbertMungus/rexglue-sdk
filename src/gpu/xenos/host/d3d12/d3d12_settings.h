@@ -32,6 +32,17 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, readback_memexport, false,
               "Read data written by memory export in shaders on the CPU");
   REX_SETTING(bool, readback_resolve, false, "Read render to texture results on the CPU");
+  REX_SETTING(bool, async_replay, false,
+              "Record, execute and signal closed submissions on a separate GPU Replay thread "
+              "instead of the GPU command thread");
+  REX_SETTING(i32, upload_copy_workers, 0,
+              "Threads that copy guest memory into upload buffers off the GPU command thread, 0 "
+              "copies inline. Command lists and guest-visible writes wait for the queued copies",
+              Range{0, 4});
+  REX_SETTING(i32, upload_prefetch_frames, 0,
+              "At frame start, upload again in one batch the parts of the ranges uploaded on demand "
+              "in this many previous frames that are invalid again, 0 turns it off",
+              Range{0, 7});
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");

@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -32,6 +35,13 @@ namespace rex::gpu {
  */
 class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysicalWriteListener {
  public:
+  /**
+   * Limits how far OnPhysicalWrite widens a CPU write's invalidation: to the aligned 2^log2 page
+   * group around the written pages (0 to 6; 6 keeps the 64 page block). bo2-bisect perf/0050.
+   */
+  void SetInvalidationWidthLog2(u32 log2) {
+    invalidation_width_log2_.store(std::min<u32>(log2, 6), std::memory_order_relaxed);
+  }
   static constexpr u32 kBufferSizeLog2 = 29;
   static constexpr u32 kBufferSize = 1 << kBufferSizeLog2;
 
@@ -162,6 +172,7 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
 
   /** Log2 of the system page size, the invalidation granularity. */
   u32 page_size_log2_;
+  std::atomic<u32> invalidation_width_log2_{6};
 
   bool AllocateHostGPUMemory(u32 start, u32 length);
   u32 host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

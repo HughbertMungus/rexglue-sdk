@@ -72,6 +72,11 @@ class XenosSettings : public SettingOwner {
   REX_SETTING(bool, clear_memory_page_state, true,
               "Refresh the page valid state from GPU written memory at frame end. Turning it off "
               "lowers CPU cost but may break memory coherency");
+  REX_SETTING(i32, cpu_write_invalidation_pages_log2, 6,
+              "How far a CPU write's invalidation of GPU memory widens around the written pages, as "
+              "log2 pages (0 = only the written pages, 6 = up to the 64 page block). Wider means "
+              "fewer write faults but more valid data uploaded again",
+              Range{0, 6});
   REX_SETTING(bool, occlusion_query_enable, true, "Enable host occlusion query handling");
   REX_SETTING(bool, readback_resolve_half_pixel_offset, false,
               "When draw resolution scaling is active, sample from the center of each scaled block "

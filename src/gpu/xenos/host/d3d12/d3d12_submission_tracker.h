@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "gpu/xenos/host/d3d12/d3d12_api.h"
 #include <rex/types.h>
 #include <rex/utility.h>
@@ -77,7 +79,16 @@ class D3D12SubmissionTracker : public rex::NonCopyable {
    */
   bool TrySignalEnqueueing();
 
+  /**
+   * When set, fence signals go to this function, which must put them on the queue in order with
+   * the producer's other work, instead of being signaled on the queue here (async replay).
+   */
+  void SetSignalOverride(std::function<bool(ID3D12Fence* fence, UINT64 value)> signal_override) {
+    signal_override_ = std::move(signal_override);
+  }
+
  private:
+  std::function<bool(ID3D12Fence* fence, UINT64 value)> signal_override_;
   UINT64 submission_current_ = 1;
   UINT64 submission_signal_queued_ = 0;
   HANDLE fence_completion_event_ = nullptr;

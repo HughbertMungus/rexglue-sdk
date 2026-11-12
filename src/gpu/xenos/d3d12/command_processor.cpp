@@ -21,6 +21,7 @@
 #include <rex/assert.h>
 #include <rex/platform/perf.h>
 #include "gpu/xenos/d3d12/command_processor.h"
+#include <rex/platform/thread.h>
 #include "gpu/xenos/physical_memory.h"
 #include "gpu/xenos/d3d12/d3d12_xenos_graphics_driver.h"
 #include "gpu/xenos/d3d12/shader.h"
@@ -853,6 +854,8 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional, added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  StartAsyncReplay();
+
   bindless_resources_used_ = GetD3D12Settings().bindless.Get() &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -1523,9 +1526,107 @@ bool D3D12CommandProcessor::SetupContext() {
   return true;
 }
 
+void D3D12CommandProcessor::StartAsyncReplay() {
+  if (replay_thread_.joinable()) {
+    return;
+  }
+  replay_shutdown_ = false;
+  replay_busy_ = false;
+  replay_async_ = true;
+  replay_thread_ = std::thread([this]() { ReplayThreadMain(); });
+}
+
+void D3D12CommandProcessor::StopAsyncReplay() {
+  if (!replay_thread_.joinable()) {
+    return;
+  }
+  FlushAsyncReplay();
+  if (replay_presenter_hooked_ && graphics_system_) {
+    if (auto* presenter =
+            static_cast<gpu::d3d12::D3D12Presenter*>(graphics_system_->GetHostPresenter())) {
+      presenter->SetGuestOutputRefresherSignalOverride(nullptr);
+    }
+  }
+  replay_presenter_hooked_ = false;
+  {
+    std::lock_guard<std::mutex> lock(replay_mutex_);
+    replay_shutdown_ = true;
+  }
+  replay_cv_.notify_all();
+  replay_thread_.join();
+  replay_async_ = false;
+  replay_active_ = false;
+  replay_lists_free_.clear();
+  replay_lists_all_.clear();
+}
+
+void D3D12CommandProcessor::ReplayEnqueue(const ReplayJob& job) {
+  {
+    std::lock_guard<std::mutex> lock(replay_mutex_);
+    replay_queue_.push_back(job);
+  }
+  replay_cv_.notify_all();
+}
+
+void D3D12CommandProcessor::FlushAsyncReplay() {
+  if (!replay_async_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(replay_mutex_);
+  replay_cv_.wait(lock, [this]() { return replay_queue_.empty() && !replay_busy_; });
+}
+
+void D3D12CommandProcessor::ReplayThreadMain() {
+  rex::platform::SetCurrentThreadName("GPU Replay");
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  while (true) {
+    ReplayJob job;
+    {
+      std::unique_lock<std::mutex> lock(replay_mutex_);
+      replay_cv_.wait(lock, [this]() { return replay_shutdown_ || !replay_queue_.empty(); });
+      if (replay_queue_.empty()) {
+        break;  // Shutdown with nothing left.
+      }
+      job = replay_queue_.front();
+      replay_queue_.pop_front();
+      replay_busy_ = true;
+    }
+    if (job.list) {
+      shared_memory_->WaitForUploads(job.upload_ticket);
+      job.allocator->Reset();
+      command_list_->Reset(job.allocator, nullptr);
+      job.list->Execute(command_list_, command_list_1_);
+      command_list_->Close();
+      ID3D12CommandList* execute_command_lists[] = {command_list_};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+      direct_queue->Signal(submission_fence_, job.value);
+      job.list->Reset();
+    } else if (job.fence) {
+      direct_queue->Signal(job.fence, job.value);
+      job.fence->Release();
+      // The only fence jobs are the presenter's guest output refresher signals (IssueSwap).
+      if (graphics_system_) {
+        if (auto* presenter =
+                static_cast<gpu::d3d12::D3D12Presenter*>(graphics_system_->GetHostPresenter())) {
+          presenter->NoteGuestOutputQueued(job.value);
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(replay_mutex_);
+      if (job.list) {
+        replay_lists_free_.push_back(job.list);
+      }
+      replay_busy_ = false;
+    }
+    replay_cv_.notify_all();
+  }
+}
+
 void D3D12CommandProcessor::ShutdownContext() {
   window_title_state_.store(0, std::memory_order_release);
   AwaitAllQueueOperationsCompletion();
+  StopAsyncReplay();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1798,6 +1899,20 @@ void D3D12CommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 
   if (!graphics_system_)
     return;
   gpu::Presenter* presenter = graphics_system_->GetHostPresenter();
+  if (presenter && replay_async_ && !replay_presenter_hooked_) {
+    // The presenter's "guest output ready" signal must follow this frame's replayed submission
+    // on the queue, so it goes through the replay thread too.
+    static_cast<gpu::d3d12::D3D12Presenter*>(presenter)->SetGuestOutputRefresherSignalOverride(
+        [this](ID3D12Fence* fence, UINT64 value) -> bool {
+          fence->AddRef();
+          ReplayJob job;
+          job.fence = fence;
+          job.value = value;
+          ReplayEnqueue(job);
+          return true;
+        });
+    replay_presenter_hooked_ = true;
+  }
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
     return;
@@ -2127,6 +2242,13 @@ void D3D12CommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 
 
   // End the frame even without presenting, to prevent leaking per frame resources.
   EndSubmission(true);
+}
+
+void D3D12CommandProcessor::SyncGuestVisible() {
+  // The guest may refill buffers once it sees progress, so their queued upload copies must be done.
+  if (shared_memory_ && !shared_memory_->UploadsDone(shared_memory_->UploadTicket())) {
+    shared_memory_->WaitForUploads(shared_memory_->UploadTicket());
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -2957,6 +3079,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(u64 await_submission) {
     }
     // Queue operations done outside a submission, or after a failed end, must be awaited here.
     if (queue_operations_done_since_submission_signal_) {
+      FlushAsyncReplay();
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
       if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
@@ -3191,6 +3314,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    shared_memory_->PrefetchHotRanges();
   }
 
   return true;
@@ -3241,12 +3366,44 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // ExecuteCommandLists boundaries are full UAV and aliasing barriers, so use one list per call.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    const bool replay_wanted = replay_async_ && GetD3D12Settings().async_replay.Get();
+    if (replay_wanted != replay_active_) {
+      if (!replay_wanted) {
+        // Back to direct replay: earlier submissions must reach the queue first.
+        FlushAsyncReplay();
+      }
+      replay_active_ = replay_wanted;
+    }
+    if (replay_active_) {
+      // The replay thread resets the allocator, records the D3D12 command list, executes it and
+      // signals submission_current_, in order.
+      DeferredCommandList* replay_list;
+      {
+        std::lock_guard<std::mutex> lock(replay_mutex_);
+        if (replay_lists_free_.empty()) {
+          replay_lists_all_.push_back(std::make_unique<DeferredCommandList>(*this));
+          replay_list = replay_lists_all_.back().get();
+        } else {
+          replay_list = replay_lists_free_.back();
+          replay_lists_free_.pop_back();
+        }
+      }
+      replay_list->SwapStream(deferred_command_list_);
+      ReplayJob job;
+      job.list = replay_list;
+      job.allocator = command_allocator;
+      job.value = submission_current_;
+      job.upload_ticket = shared_memory_->UploadTicket();
+      ReplayEnqueue(job);
+    } else {
+      shared_memory_->WaitForUploads(shared_memory_->UploadTicket());
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      deferred_command_list_.Execute(command_list_, command_list_1_);
+      command_list_->Close();
+      ID3D12CommandList* execute_command_lists[] = {command_list_};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -3260,7 +3417,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
+    if (replay_active_) {
+      ++submission_current_;  // Signaled by the replay thread.
+    } else {
+      direct_queue->Signal(submission_fence_, submission_current_++);
+    }
 
     submission_open_ = false;
 
@@ -3270,6 +3431,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (GetXenosSettings().clear_memory_page_state.Get() && shared_memory_) {
       shared_memory_->SetSystemPageFlagsValidWithGPUDataWritten();
+    }
+    if (shared_memory_) {
+      shared_memory_->SetInvalidationWidthLog2(
+          static_cast<u32>(GetXenosSettings().cpu_write_invalidation_pages_log2.Get()));
     }
     frame_open_ = false;
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;

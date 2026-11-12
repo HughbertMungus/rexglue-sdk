@@ -1144,6 +1144,7 @@ bool D3D12TextureCache::CommitScaledResolveMemory(u32 start_unscaled, u32 length
           static_cast<UINT>(((static_cast<u64>(i) << kScaledResolveHeapSizeLog2) -
                              (static_cast<u64>(buffer_index) << 30)) /
                             D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+      command_processor_.FlushAsyncReplay();  // keep queue order with async replay
       direct_queue->UpdateTileMappings(
           scaled_resolve_2gb_buffers_[buffer_index]->GetResource(), 1, &region_start_coordinates,
           &region_size, scaled_resolve_heap.Get(), 1, &range_flags, &heap_range_start_offset,
