@@ -142,6 +142,30 @@ void SharedMemory::UnregisterGlobalWatch(GlobalWatchHandle handle) {
   }
 }
 
+bool SharedMemory::IsRangeValid(const ScopeGuard&, u32 start, u32 length) const {
+  if (!length || start >= kBufferSize) {
+    return true;
+  }
+  length = std::min(length, kBufferSize - start);
+  const u32 page_first = start >> page_size_log2_;
+  const u32 page_last = (start + length - 1) >> page_size_log2_;
+  const u32 block_first = page_first >> 6;
+  const u32 block_last = page_last >> 6;
+  for (u32 i = block_first; i <= block_last; ++i) {
+    u64 mask = ~u64{0};
+    if (i == block_first) {
+      mask &= ~((u64{1} << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      mask &= (u64{1} << ((page_last & 63) + 1)) - 1;
+    }
+    if ((system_page_flags_valid_[i] & mask) != mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
 SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(const ScopeGuard&, u32 start, u32 length,
                                                          WatchCallback callback,
                                                          void* callback_context,

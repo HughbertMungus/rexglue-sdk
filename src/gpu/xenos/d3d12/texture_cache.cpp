@@ -674,11 +674,13 @@ void D3D12TextureCache::RequestTextures(u32 used_texture_mask) {
       }
       D3D12Texture* texture = static_cast<D3D12Texture*>(binding->texture);
       if (texture) {
+        texture->Refresh3DAs2DResource();
         texture->GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
       }
       D3D12Texture* texture_signed = static_cast<D3D12Texture*>(binding->texture_signed);
       if (texture_signed) {
+        texture_signed->Refresh3DAs2DResource();
         texture_signed->GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
       }
@@ -1795,6 +1797,9 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  if (load_base) {
+    d3d12_texture.BumpBaseLoadGeneration();
+  }
   return true;
 }
 
@@ -1834,6 +1839,78 @@ void D3D12TextureCache::UpdateHostTextureBindings(u32 fetch_constant_mask) {
       }
     }
   }
+}
+
+void D3D12TextureCache::D3D12Texture::Refresh3DAs2DResource() {
+  // The 3D as 2D wrapper (a tfetch2D of a 3D texture) used to be loaded from guest memory once
+  // and never again, so it kept that moment's data while e.g. BO2's GPU generated 32x32x32 model
+  // lighting volume changes every frame: flickering, darkening weapons, arms and props
+  // (bo2-bisect fix/0001). It is now a copy of this texture's level 0, slice 0, redone whenever
+  // level 0 reloads. Called in the texture request phase; a no-op while the data is unchanged.
+  if (!texture_3d_as_2d_ || !base_load_generation_ ||
+      wrapper_copied_generation_ == base_load_generation_) {
+    return;
+  }
+  auto& d3d12_cache = static_cast<D3D12TextureCache&>(GetTextureCache());
+  D3D12CommandProcessor& command_processor = d3d12_cache.command_processor_;
+  ID3D12Device* device = command_processor.GetD3D12Provider().GetDevice();
+  ID3D12Resource* wrapper = texture_3d_as_2d_->GetResource();
+  const D3D12_RESOURCE_DESC wrapper_desc = wrapper->GetDesc();
+  const u32 layers = wrapper_desc.DepthOrArraySize;
+  if (layers == 0 || layers > xenos::kTexture3DMaxDepth) {
+    return;
+  }
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(layers);
+  UINT64 total_size = 0;
+  device->GetCopyableFootprints(&wrapper_desc, 0, layers, 0, footprints.data(), nullptr, nullptr,
+                                &total_size);
+  ID3D12Resource* scratch = command_processor.RequestScratchGPUBuffer(
+      static_cast<u32>(total_size), D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!scratch) {
+    return;
+  }
+  // 3D level 0, slice by slice, into the buffer (D3D12 copies no texture data between 3D and 2D
+  // textures directly).
+  command_processor.PushTransitionBarrier(GetResource(),
+                                          SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor.SubmitBarriers();
+  DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
+  D3D12_TEXTURE_COPY_LOCATION texture_location = {};
+  texture_location.pResource = GetResource();
+  texture_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  texture_location.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION buffer_location = {};
+  buffer_location.pResource = scratch;
+  buffer_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  for (u32 z = 0; z < layers; ++z) {
+    buffer_location.PlacedFootprint = footprints[z];
+    D3D12_BOX box;
+    box.left = 0;
+    box.top = 0;
+    box.front = z;
+    box.right = static_cast<UINT>(wrapper_desc.Width);
+    box.bottom = wrapper_desc.Height;
+    box.back = z + 1;
+    command_list.D3DCopyTextureRegion(&buffer_location, 0, 0, 0, &texture_location, &box);
+  }
+  // The buffer into the wrapper's layers.
+  command_processor.PushTransitionBarrier(scratch, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor.PushTransitionBarrier(
+      wrapper, texture_3d_as_2d_->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION wrapper_location = {};
+  wrapper_location.pResource = wrapper;
+  wrapper_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (u32 z = 0; z < layers; ++z) {
+    wrapper_location.SubresourceIndex = z;
+    buffer_location.PlacedFootprint = footprints[z];
+    command_list.D3DCopyTextureRegion(&wrapper_location, 0, 0, 0, &buffer_location, nullptr);
+  }
+  command_processor.ReleaseScratchGPUBuffer(scratch, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  wrapper_copied_generation_ = base_load_generation_;
 }
 
 ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
@@ -1878,18 +1955,16 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
     REXGPU_FAIL(nullptr, "Failed to create the 3D as 2D wrapper resource");
   }
 
+  // Filled by copying this texture's loaded level 0 (Refresh3DAs2DResource), not by its own
+  // guest memory load and watch, which nothing ever repeated.
   TextureKey key_2d = GetKey();
+  key_2d.dimension = xenos::DataDimension::k2DOrStacked;
   key_2d.depth_or_array_size_minus_1 = 0;
   key_2d.mip_max_level = 0;
   texture_3d_as_2d_ =
       std::make_unique<D3D12Texture>(d3d12_cache, key_2d, resource_2d.Get(), initial_state, false);
-  texture_3d_as_2d_->SetForceLoad3DTiling(true);
-
-  if (!d3d12_cache.LoadTextureData(*texture_3d_as_2d_)) {
-    REXGPU_ERROR("D3D12TextureCache: Failed to load 3D as 2D wrapper data");
-    texture_3d_as_2d_.reset();
-    return nullptr;
-  }
+  wrapper_copied_generation_ = UINT64_MAX;
+  Refresh3DAs2DResource();
 
   d3d12_cache.command_processor_.PushTransitionBarrier(
       texture_3d_as_2d_->GetResource(), texture_3d_as_2d_->SetResourceState(end_state), end_state);

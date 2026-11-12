@@ -276,6 +276,12 @@ class D3D12TextureCache final : public TextureCache {
     };
 
     ID3D12Resource* GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATES end_state);
+    /**
+     * Copies slice 0 of level 0 into the 3D as 2D wrapper when level 0 was reloaded since the
+     * last copy (bo2-bisect fix/0001).
+     */
+    void Refresh3DAs2DResource();
+    void BumpBaseLoadGeneration() { ++base_load_generation_; }
 
     explicit D3D12Texture(D3D12TextureCache& texture_cache, const TextureKey& key,
                           ID3D12Resource* resource, D3D12_RESOURCE_STATES resource_state,
@@ -303,6 +309,9 @@ class D3D12TextureCache final : public TextureCache {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
+    /** Level 0 load counter of this texture, and the value the wrapper was copied at. */
+    u64 base_load_generation_ = 0;
+    u64 wrapper_copied_generation_ = UINT64_MAX;
 
     /** Bindful uses the non shader visible cache, bindless the global shader visible heap. */
     std::unordered_map<SRVDescriptorKey, u32, SRVDescriptorKey::Hasher> srv_descriptors_;

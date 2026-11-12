@@ -476,21 +476,42 @@ TextureCache::Texture::~Texture() {
 
 void TextureCache::Texture::UpdateAndWatch(const ScopeGuard& watch_lock) {
   SharedMemory& shared_memory = GetTextureCache().GetSharedMemory();
+  // The data went to the shared memory before this point. If the CPU wrote to a part's pages since,
+  // that invalidation fired the page watches before this texture's watch existed and left the pages
+  // unprotected, so no later write would be caught either: such a part stays outdated, and the next
+  // draw reloads it, instead of marking stale data current (bo2-bisect fix/0002: BO2's CPU written
+  // model lighting texture kept stale data, flickering weapons, arms and props).
+  // Scaled resolve textures keep the old behaviour: bo2-bisect only ran at resolution scale 1.
+  const bool scaled = GetKey().scaled_resolve;
+  bool part_stale = false;
   if (base_outdated_) {
     REX_ASSERT(GetGuestBaseSize() != 0);
-    base_outdated_ = false;
-    base_watch_handle_ =
-        shared_memory.WatchMemoryRange(watch_lock, GetKey().base_page << 12, GetGuestBaseSize(),
-                                       TextureCache::WatchCallback, this, nullptr, 0);
-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    if (scaled ||
+        shared_memory.IsRangeValid(watch_lock, GetKey().base_page << 12, GetGuestBaseSize())) {
+      base_outdated_ = false;
+      base_watch_handle_ =
+          shared_memory.WatchMemoryRange(watch_lock, GetKey().base_page << 12, GetGuestBaseSize(),
+                                         TextureCache::WatchCallback, this, nullptr, 0);
+      outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    } else {
+      part_stale = true;
+    }
   }
   if (mips_outdated_) {
     REX_ASSERT(GetGuestMipsSize() != 0);
-    mips_outdated_ = false;
-    mips_watch_handle_ =
-        shared_memory.WatchMemoryRange(watch_lock, GetKey().mip_page << 12, GetGuestMipsSize(),
-                                       TextureCache::WatchCallback, this, nullptr, 1);
-    outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+    if (scaled ||
+        shared_memory.IsRangeValid(watch_lock, GetKey().mip_page << 12, GetGuestMipsSize())) {
+      mips_outdated_ = false;
+      mips_watch_handle_ =
+          shared_memory.WatchMemoryRange(watch_lock, GetKey().mip_page << 12, GetGuestMipsSize(),
+                                         TextureCache::WatchCallback, this, nullptr, 1);
+      outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+    } else {
+      part_stale = true;
+    }
+  }
+  if (part_stale) {
+    GetTextureCache().texture_became_outdated_.store(true, std::memory_order_release);
   }
 }
 

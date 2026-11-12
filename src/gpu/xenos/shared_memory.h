@@ -88,6 +88,12 @@ class REX_GPU_XENOS_API SharedMemory : public rex::NonCopyable, public IPhysical
   bool RequestRange(u32 start, u32 length);
 
   /**
+   * Whether every page of the range is still valid: uploaded and not written by the CPU since.
+   * Called with the memory watch lock held.
+   */
+  bool IsRangeValid(const ScopeGuard& lock, u32 start, u32 length) const;
+
+  /**
    * Marks the range as modified by the CPU and invalidates GPU written pages inside it. Unless
    * exact_range is true, the range widens to the nearest GPU written pages, at most 256 KB. Called
    * with the memory watch lock held.
