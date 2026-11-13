@@ -15,7 +15,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <cstdio>
+#include <share.h>
+#include <format>
 #include <iterator>
+#include <unordered_map>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -3304,6 +3309,81 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+namespace {
+// Render target transfer census (gpu.d3d12.rt_transfer_census, after bo2-bisect perf/0045).
+// Kind = src depth | dst depth << 1 | host depth source << 2 | src MSAA log2 << 3 |
+// dst MSAA log2 << 5. Pixels are guest (unscaled) pixels of the transferred rectangles.
+// Pairs are keyed by the source and destination RenderTargetKey (EDRAM base, pitch, MSAA,
+// format) - the same pair every frame is the same two host render targets.
+struct RtxStat {
+  u64 count = 0;
+  u64 pixels = 0;
+};
+struct RtxCensus {
+  u64 calls = 0;
+  u64 clears = 0;
+  u64 tiles = 0;
+  RtxStat kinds[128];
+  std::unordered_map<u64, RtxStat> pairs;
+};
+RtxCensus g_rtx_census;
+}  // namespace
+
+void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
+  // d|c, width in pixels x MSAA samples, @ EDRAM base tile, format.
+  auto RtxKeyText = [](u32 key_value) {
+    RenderTargetKey key;
+    key.key = key_value;
+    return std::format("{}{}x{}@{}t:{}", key.is_depth ? "d" : "c", key.GetWidth(),
+                       static_cast<u32>(1) << static_cast<u32>(key.msaa_samples),
+                       static_cast<u32>(key.base_tiles), key.GetFormatName());
+  };
+  static std::FILE* out = nullptr;
+  RtxCensus& c = g_rtx_census;
+  if (frames && (c.calls || c.clears)) {
+    if (!out) {
+      out = _fsopen("mp_rtx.txt", "a", _SH_DENYNO);  // readable while the game runs
+    }
+    if (out) {
+      const double fr = static_cast<double>(frames);
+      u64 total_n = 0, total_px = 0;
+      for (const RtxStat& s : c.kinds) {
+        total_n += s.count;
+        total_px += s.pixels;
+      }
+      const std::time_t t = std::time(nullptr);
+      std::tm tm_local{};
+      localtime_s(&tm_local, &t);
+      std::fprintf(out,
+                   "%02d:%02d:%02d frames=%llu per_frame: calls=%.1f clears=%.1f transfers=%.1f "
+                   "kpx=%.1f tiles=%.0f |",
+                   tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
+                   static_cast<unsigned long long>(frames), c.calls / fr, c.clears / fr,
+                   total_n / fr, total_px / fr / 1000.0, c.tiles / fr);
+      static const char* kMs[4] = {"1", "2", "4", "?"};
+      for (u32 k = 0; k < 128; ++k) {
+        if (!c.kinds[k].count) continue;
+        std::fprintf(out, " %s%s>%s%s%s:%.1f/%.0fk", (k & 1) ? "d" : "c", kMs[(k >> 3) & 3],
+                     (k & 2) ? "d" : "c", kMs[(k >> 5) & 3], (k & 4) ? "+hd" : "",
+                     c.kinds[k].count / fr, c.kinds[k].pixels / fr / 1000.0);
+      }
+      std::vector<std::pair<u64, RtxStat>> pairs(c.pairs.begin(), c.pairs.end());
+      std::sort(pairs.begin(), pairs.end(),
+                [](const auto& a, const auto& b) { return a.second.pixels > b.second.pixels; });
+      std::fprintf(out, " | top:");
+      for (size_t i = 0; i < pairs.size() && i < 12; ++i) {
+        const u32 src = static_cast<u32>(pairs[i].first >> 32);
+        const u32 dst = static_cast<u32>(pairs[i].first);
+        std::fprintf(out, " %s>%s:%.1f/%.0fk", RtxKeyText(src).c_str(), RtxKeyText(dst).c_str(),
+                     pairs[i].second.count / fr, pairs[i].second.pixels / fr / 1000.0);
+      }
+      std::fprintf(out, "\n");
+      std::fflush(out);
+    }
+  }
+  c = RtxCensus{};
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     u32 render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -3318,6 +3398,38 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  if (command_processor_.GetD3D12Settings().rt_transfer_census.Get()) {
+    bool any = false;
+    for (u32 i = 0; i < render_target_count && render_target_transfers; ++i) {
+      if (!render_targets[i]) continue;
+      const RenderTargetKey dk = render_targets[i]->GetKey();
+      for (const Transfer& t : render_target_transfers[i]) {
+        any = true;
+        const RenderTargetKey sk = t.source->GetKey();
+        const u32 kind = static_cast<u32>(sk.is_depth) | (static_cast<u32>(dk.is_depth) << 1) |
+                         (static_cast<u32>(t.host_depth_source != nullptr) << 2) |
+                         (static_cast<u32>(sk.msaa_samples) << 3) |
+                         (static_cast<u32>(dk.msaa_samples) << 5);
+        Transfer::Rectangle rects[Transfer::kMaxRectanglesWithCutout];
+        const u32 rc = t.GetRectangles(dk.base_tiles, dk.GetPitchTiles(), dk.msaa_samples,
+                                       dk.Is64bpp(), rects,
+                                       resolve_clear_needed ? resolve_clear_rectangle : nullptr);
+        u64 px = 0;
+        for (u32 k = 0; k < rc; ++k) {
+          px += static_cast<u64>(rects[k].width_pixels) * rects[k].height_pixels;
+        }
+        RtxStat& ks = g_rtx_census.kinds[kind & 127];
+        ++ks.count;
+        ks.pixels += px;
+        RtxStat& ps = g_rtx_census.pairs[(static_cast<u64>(sk.key) << 32) | dk.key];
+        ++ps.count;
+        ps.pixels += px;
+        g_rtx_census.tiles += t.end_tiles - t.start_tiles;
+      }
+    }
+    if (any) ++g_rtx_census.calls;
+    if (resolve_clear_needed) ++g_rtx_census.clears;
+  }
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
     // The rectangle is clamped by the common render target cache setup.

@@ -58,6 +58,9 @@ class D3D12Settings : public SettingOwner {
               "resolves, texture loads, uploads, present) with timestamp queries; the fps log "
               "(REX_FPS_LOG=1) gets gp_* fields in ms per profiled frame. 0 turns it off",
               Range{0, 1000});
+  REX_SETTING(bool, rt_transfer_census, false,
+              "Count render target ownership transfers by kind and by source -> destination render "
+              "target, one line a second in mp_rtx.txt (needs REX_FPS_LOG=1)");
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");

@@ -72,6 +72,17 @@ std::atomic<u64> g_gpu_prof_marks{0};
 }  // namespace
 
 std::string D3D12CommandProcessor::GpuProfLogTags() const {
+  // Render target transfer census: mp_rtx.txt, once a second with the fps log.
+  {
+    static u64 census_last_frame = 0;
+    if (render_target_cache_) {
+      const u64 frames = frame_current_ - census_last_frame;
+      census_last_frame = frame_current_;
+      if (GetD3D12Settings().rt_transfer_census.Get()) {
+        render_target_cache_->RtxCensusWrite(frames);
+      }
+    }
+  }
   if (!GetD3D12Settings().gpu_profile_interval.Get() &&
       !g_gpu_prof_frames.load(std::memory_order_relaxed)) {
     return {};

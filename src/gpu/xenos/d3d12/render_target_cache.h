@@ -58,6 +58,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void CompletedSubmissionUpdated();
   void BeginSubmission();
 
+  /**
+   * Render target transfer census (gpu.d3d12.rt_transfer_census): appends the counts collected
+   * since the last call, per frame over `frames` frames, as one line to mp_rtx.txt and resets them.
+   * Called once a second from the fps log on the GPU command thread.
+   */
+  void RtxCensusWrite(u64 frames);
+
   Path GetPath() const override { return path_; }
 
   bool Update(bool is_rasterization_done, xenos::reg::RB_DEPTHCONTROL normalized_depth_control,
