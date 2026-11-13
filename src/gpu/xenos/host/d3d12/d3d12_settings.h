@@ -65,6 +65,11 @@ class D3D12Settings : public SettingOwner {
               "Skip a render target transfer when its source and destination already hold the "
               "same data on that range: the last transfer between them on it, either way, was "
               "followed by no draw writing, clear or other transfer into either one");
+  REX_SETTING(bool, msaa_4x_alias_as_1x, false,
+              "Draw a 4x MSAA view of EDRAM that a 1x render target with the same base, pitch and "
+              "format already owns into that 1x target at twice the resolution, instead of "
+              "transferring the range to a 4x target and back (the Xbox 360 D3D clear of a 1x "
+              "surface through a half-size 4x view)");
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");

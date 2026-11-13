@@ -2648,6 +2648,13 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
 
   u32 draw_resolution_scale_x = texture_cache_->GetDrawResolutionScaleX();
   u32 draw_resolution_scale_y = texture_cache_->GetDrawResolutionScaleY();
+  // A 4x view drawn into the 1x render targets owning its EDRAM (gpu.d3d12.msaa_4x_alias_as_1x):
+  // each guest pixel of the 4x view is 2x2 samples, which are 2x2 pixels of the 1x target.
+  const bool msaa_4x_as_1x = host_render_targets_used && render_target_cache_->IsLastUpdateMsaa4xAs1x();
+  if (msaa_4x_as_1x) {
+    draw_resolution_scale_x *= 2;
+    draw_resolution_scale_y *= 2;
+  }
 
   bool convert_z_to_float24 =
       host_render_targets_used && render_target_cache_->IsDepthFloat24ConvertedInPixelShader();
@@ -2665,7 +2672,8 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
               sizeof(viewport_key.vport_regs));
   viewport_key.flags = (static_cast<u32>(convert_z_to_float24) << 0) |
                        (static_cast<u32>(host_render_targets_used) << 1) |
-                       (static_cast<u32>(ps_writes_depth) << 2);
+                       (static_cast<u32>(ps_writes_depth) << 2) |
+                       (static_cast<u32>(msaa_4x_as_1x) << 3);
 
   draw_state::HostViewport viewport_info;
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {

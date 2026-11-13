@@ -344,6 +344,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                u32 normalized_color_mask, const Shader& vertex_shader) {
   const xenos::RegisterFile& regs = GetRegisterFile();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  last_update_msaa_4x_as_1x_ = false;
 
   auto rb_surface_info = regs.Get<xenos::reg::RB_SURFACE_INFO>();
   xenos::MSAASamples msaa_samples = rb_surface_info.msaa_samples;
@@ -518,13 +519,6 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
-    if (!interlock_barrier_only) {
-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
-        return false;
-      }
-      rts[rt_bit_index] = render_target;
-    }
     u32 rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
     // The last target can extend to the first one's base (itself if alone), wrapping in EDRAM.
     rt_lengths_tiles[i] = std::min(std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
@@ -533,6 +527,44 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (xenos::kEDRAMTileCount + edram_bases_sorted[0].first)) -
                                        rt_base);
+  }
+
+  // 4x view of a 1x surface (e.g. the Xbox 360 D3D clear of a 1x surface through a half-size 4x
+  // view): the 4x and 1x keys with the same base, pitch and format cover the same EDRAM samples one
+  // to one. If the 1x target already owns every range and the 4x one would need transfers, draw
+  // into the 1x target at twice the resolution instead (the implementation scales the viewport and
+  // uses a 1x pipeline) - no transfer into the 4x target and none back.
+  last_update_msaa_4x_as_1x_ = false;
+  if (!interlock_barrier_only && msaa_samples == xenos::MSAASamples::k4X &&
+      IsMsaa4xAs1xEnabled()) {
+    bool redirect = edram_bases_sorted_count != 0;
+    bool any_transfer_avoided = false;
+    for (u32 i = 0; redirect && i < edram_bases_sorted_count; ++i) {
+      RenderTargetKey key_4x = rt_keys[edram_bases_sorted[i].second];
+      RenderTargetKey key_1x = key_4x;
+      key_1x.msaa_samples = xenos::MSAASamples::k1X;
+      if (WouldOwnershipChangeRequireTransfers(key_1x, 0, rt_lengths_tiles[i])) {
+        redirect = false;
+      } else if (WouldOwnershipChangeRequireTransfers(key_4x, 0, rt_lengths_tiles[i])) {
+        any_transfer_avoided = true;
+      }
+    }
+    if (redirect && any_transfer_avoided) {
+      for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
+        rt_keys[edram_bases_sorted[i].second].msaa_samples = xenos::MSAASamples::k1X;
+      }
+      last_update_msaa_4x_as_1x_ = true;
+    }
+  }
+  if (!interlock_barrier_only) {
+    for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
+      u32 rt_bit_index = edram_bases_sorted[i].second;
+      RenderTarget* render_target = GetOrCreateRenderTarget(rt_keys[rt_bit_index]);
+      if (!render_target) {
+        return false;
+      }
+      rts[rt_bit_index] = render_target;
+    }
   }
 
   if (interlock_barrier_only) {

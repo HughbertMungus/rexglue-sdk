@@ -129,6 +129,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool IsGammaFormatHostStorageSeparate() const override;
 
+  /** gpu.d3d12.msaa_4x_alias_as_1x, host render targets only. */
+  bool IsMsaa4xAs1xEnabled() const override;
+
   void RequestPixelShaderInterlockBarrier() override;
 
  private:

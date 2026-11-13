@@ -144,6 +144,12 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
    * @param depth_and_color_formats_out Receives each target's resource format, may be null.
    */
   u32 GetLastUpdateBoundRenderTargets(u32* depth_and_color_formats_out = nullptr) const;
+  /**
+   * True when the last Update bound the 1x render targets for a 4x draw whose EDRAM ranges the 1x
+   * targets owned (IsMsaa4xAs1xEnabled). The draw must then use a 1x pipeline and twice the draw
+   * resolution scale in each direction.
+   */
+  bool IsLastUpdateMsaa4xAs1x() const { return last_update_msaa_4x_as_1x_; }
 
  protected:
   RenderTargetCache(const xenos::RegisterFile& register_file, const XenosSettings& settings,
@@ -423,6 +429,9 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
    */
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
+  /** Whether Update may draw a 4x view of 1x-owned EDRAM into the 1x targets; see Update. */
+  virtual bool IsMsaa4xAs1xEnabled() const { return false; }
+
   void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
   RenderTarget* const* GetLastUpdateAccumulatedRenderTargets() const {
     REX_ASSERT(GetPath() == Path::kHostRenderTargets);
@@ -598,6 +607,7 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
    * Valid only off the pixel shader interlock path.
    */
   RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  bool last_update_msaa_4x_as_1x_ = false;
   /**
    * Render targets of the last successful update or earlier ones, unless a different or new one
    * was bound or surface info changed, to avoid needless switching (undesirable on tile based

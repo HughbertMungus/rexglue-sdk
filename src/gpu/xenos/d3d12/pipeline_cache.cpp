@@ -1428,6 +1428,10 @@ bool PipelineCache::GetCurrentStateDescription(
     }
   }
   xenos::MSAASamples host_msaa_samples = regs.Get<xenos::reg::RB_SURFACE_INFO>().msaa_samples;
+  if (!edram_rov_used && render_target_cache_.IsLastUpdateMsaa4xAs1x()) {
+    // A 4x view drawn into the 1x render targets that own its EDRAM (msaa_4x_alias_as_1x).
+    host_msaa_samples = xenos::MSAASamples::k1X;
+  }
   if (edram_rov_used) {
     if (host_msaa_samples == xenos::MSAASamples::k2X) {
       // 2 is not supported in ForcedSampleCount on Nvidia.
