@@ -73,6 +73,9 @@ struct RtxCensus {
   std::unordered_map<u64, RtxStat> pairs;
 };
 RtxCensus g_rtx_census;
+// Render targets drawn through the 4x-as-1x redirect since launch (1x key -> draws), not reset
+// per second, so rare ones (e.g. a cached shadow map cleared once in a while) stay visible.
+std::unordered_map<u32, u64> g_rtx_as1x_seen;
 
 // Transfer memo (gpu.d3d12.rt_transfer_memo): after a transfer between two render targets on a
 // tile range, both hold the same data there until either is written (write versions). Keyed by
@@ -1047,6 +1050,11 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       const bool census = command_processor_.GetD3D12Settings().rt_transfer_census.Get();
       if (census && IsLastUpdateMsaa4xAs1x()) {
         ++g_rtx_census.msaa_4x_as_1x_draws;
+        for (u32 i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (used[i]) {
+            ++g_rtx_as1x_seen[used[i]->GetKey().key];
+          }
+        }
       }
       if (census && IsLastUpdateMsaa4xAs1xRefused()) {
         ++g_rtx_census.msaa_4x_as_1x_refused;
@@ -3483,6 +3491,10 @@ void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
       std::vector<std::pair<u32, std::pair<u64, u64>>> draws(c.draws.begin(), c.draws.end());
       std::sort(draws.begin(), draws.end(),
                 [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+      std::fprintf(out, " | as1x_seen(total):");
+      for (const auto& [key, count] : g_rtx_as1x_seen) {
+        std::fprintf(out, " %s:%llu", RtxKeyText(key).c_str(), static_cast<unsigned long long>(count));
+      }
       std::fprintf(out, " | draws(bound/writing):");
       for (size_t i = 0; i < draws.size() && i < 16; ++i) {
         std::fprintf(out, " %s:%.1f/%.1f", RtxKeyText(draws[i].first).c_str(),
