@@ -71,6 +71,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     REX_ASSERT(submission_open_);
     return deferred_command_list_;
   }
+  /** GPU timing categories (gpu.d3d12.gpu_profile_interval); see GpuProfScope. */
+  GpuProf& gpu_prof() { return gpu_prof_; }
 
   u64 GetCurrentSubmission() const { return submission_current_; }
 
@@ -258,8 +260,11 @@ class D3D12CommandProcessor : public CommandProcessor {
            " pf=" + std::to_string(GetD3D12Settings().upload_prefetch_frames.Get()) +
            " ds=" + std::to_string(GetD3D12Settings().defer_guest_stores.Get() ? 1 : 0) +
            " fd=" + std::to_string(GetD3D12Settings().fetch_dedup.Get() ? 1 : 0) +
-           " rc=" + std::to_string(GetD3D12Settings().texture_recycle_pool_mb.Get());
+           " rc=" + std::to_string(GetD3D12Settings().texture_recycle_pool_mb.Get()) +
+           GpuProfLogTags();
   }
+  /** gp_* fields (ms per profiled frame by category) while GPU profiling is on; resets them. */
+  std::string GpuProfLogTags() const;
 
   Shader* LoadShader(xenos::ShaderType shader_type, u32 guest_address, const u32* host_address,
                      u32 dword_count) override;
@@ -475,6 +480,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // Sampled GPU timing (gpu.d3d12.gpu_profile_interval, bo2-bisect perf/0028): a profiled frame
+  // opens with the frame's first submission and closes with its swap; its timestamps are read
+  // back once that submission has completed, and summed into the fps log's gp_* fields.
+  void GpuProfBeginFrame();
+  void GpuProfEndFrame();
+  GpuProf gpu_prof_;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_prof_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_prof_readback_;
+  const u64* gpu_prof_mapping_ = nullptr;
+  u64 gpu_prof_frequency_ = 0;
+  bool gpu_prof_pending_ = false;
+  u64 gpu_prof_pending_submission_ = 0;
+  u32 gpu_prof_pending_count_ = 0;
+  u8 gpu_prof_pending_cats_[GpuProf::kMax];
 
   // Async replay (gpu.d3d12.async_replay, bo2-bisect perf/0012).
   struct ReplayJob {

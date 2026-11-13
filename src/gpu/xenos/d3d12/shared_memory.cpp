@@ -404,6 +404,7 @@ bool D3D12SharedMemory::AllocateSparseHostGPUMemoryRange(u32 offset_allocations,
 }
 
 bool D3D12SharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& upload_page_ranges) {
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kUpload);
   if (upload_page_ranges.empty()) {
     return true;
   }

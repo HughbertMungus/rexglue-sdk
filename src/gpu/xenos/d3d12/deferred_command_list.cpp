@@ -277,6 +277,29 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
+  if (gpu_prof_ && gpu_prof_->active) {
+    switch (command) {
+      case Command::kD3DClearDepthStencilView:
+      case Command::kD3DClearRenderTargetView:
+      case Command::kD3DClearUnorderedAccessViewUint:
+      case Command::kD3DCopyBufferRegion:
+      case Command::kD3DCopyResource:
+      case Command::kCopyTexture:
+      case Command::kD3DCopyTextureRegion:
+      case Command::kD3DDispatch:
+      case Command::kD3DDrawIndexedInstanced:
+      case Command::kD3DDrawInstanced:
+        if (gpu_prof_->category != gpu_prof_->last_marked && gpu_prof_->count < GpuProf::kMax - 2) {
+          u32 index = gpu_prof_->count++;
+          gpu_prof_->cats[index] = gpu_prof_->category;
+          gpu_prof_->last_marked = gpu_prof_->category;
+          D3DEndQuery(gpu_prof_->heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+        }
+        break;
+      default:
+        break;
+    }
+  }
   return command_stream_.Write(command, arguments_size_bytes);
 }
 

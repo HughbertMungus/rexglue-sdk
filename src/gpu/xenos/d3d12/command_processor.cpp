@@ -57,9 +57,134 @@ D3D12CommandProcessor::D3D12CommandProcessor(D3D12XenosGraphicsDriver* graphics_
                                              IGuestInterrupts& interrupts)
     : CommandProcessor(graphics_system, info, memory, watch, interrupts),
       deferred_command_list_(*this) {
+  deferred_command_list_.SetGpuProf(&gpu_prof_);
   driver_readback_memexport_ = &GetD3D12Settings().readback_memexport;
 }
 D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+
+namespace {
+// GPU time per category summed over the profiled frames (ns), taken by GpuProfLogTags once a
+// second (gpu.d3d12.gpu_profile_interval, bo2-bisect perf/0028).
+std::atomic<u64> g_gpu_prof_ns[GpuProf::kCount];
+std::atomic<u64> g_gpu_prof_frame_ns{0};
+std::atomic<u64> g_gpu_prof_frames{0};
+std::atomic<u64> g_gpu_prof_marks{0};
+}  // namespace
+
+std::string D3D12CommandProcessor::GpuProfLogTags() const {
+  if (!GetD3D12Settings().gpu_profile_interval.Get() &&
+      !g_gpu_prof_frames.load(std::memory_order_relaxed)) {
+    return {};
+  }
+  const u64 frames = g_gpu_prof_frames.exchange(0, std::memory_order_relaxed);
+  const u64 frame_ns = g_gpu_prof_frame_ns.exchange(0, std::memory_order_relaxed);
+  const u64 marks = g_gpu_prof_marks.exchange(0, std::memory_order_relaxed);
+  double ms[GpuProf::kCount];
+  for (u32 c = 0; c < GpuProf::kCount; ++c) {
+    const u64 ns = g_gpu_prof_ns[c].exchange(0, std::memory_order_relaxed);
+    ms[c] = frames ? static_cast<double>(ns) / 1e6 / static_cast<double>(frames) : 0.0;
+  }
+  char text[256];
+  std::snprintf(text, sizeof(text),
+                " gp_n=%llu gp_frame=%.3f gp_draw=%.3f gp_rtx=%.3f gp_res=%.3f gp_tex=%.3f "
+                "gp_up=%.3f gp_pres=%.3f gp_oth=%.3f gp_marks=%llu",
+                static_cast<unsigned long long>(frames),
+                frames ? static_cast<double>(frame_ns) / 1e6 / static_cast<double>(frames) : 0.0,
+                ms[GpuProf::kDraw], ms[GpuProf::kRtTransfer], ms[GpuProf::kResolve],
+                ms[GpuProf::kTexLoad], ms[GpuProf::kUpload], ms[GpuProf::kPresent],
+                ms[GpuProf::kOther], static_cast<unsigned long long>(frames ? marks / frames : 0));
+  return text;
+}
+
+void D3D12CommandProcessor::GpuProfBeginFrame() {
+  // Collect a finished profiled frame.
+  if (gpu_prof_pending_ && submission_completed_ >= gpu_prof_pending_submission_) {
+    gpu_prof_pending_ = false;
+    const u32 n = gpu_prof_pending_count_;
+    if (n >= 2 && gpu_prof_mapping_ && gpu_prof_frequency_) {
+      const u64* ts = gpu_prof_mapping_;
+      const double ns_per_tick = 1e9 / static_cast<double>(gpu_prof_frequency_);
+      for (u32 i = 0; i + 1 < n; ++i) {
+        if (ts[i + 1] >= ts[i]) {
+          g_gpu_prof_ns[gpu_prof_pending_cats_[i]].fetch_add(
+              static_cast<u64>(static_cast<double>(ts[i + 1] - ts[i]) * ns_per_tick),
+              std::memory_order_relaxed);
+        }
+      }
+      if (ts[n - 1] >= ts[0]) {
+        g_gpu_prof_frame_ns.fetch_add(
+            static_cast<u64>(static_cast<double>(ts[n - 1] - ts[0]) * ns_per_tick),
+            std::memory_order_relaxed);
+      }
+      g_gpu_prof_frames.fetch_add(1, std::memory_order_relaxed);
+      g_gpu_prof_marks.fetch_add(n, std::memory_order_relaxed);
+    }
+  }
+  const i32 interval = GetD3D12Settings().gpu_profile_interval.Get();
+  if (interval <= 0 || gpu_prof_pending_ || (frame_current_ % static_cast<u64>(interval)) != 0) {
+    return;
+  }
+  if (!gpu_prof_heap_) {
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+    D3D12_QUERY_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap_desc.Count = GpuProf::kMax;
+    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_prof_heap_)))) {
+      REXGPU_ERROR("GPU profiling: failed to create the timestamp query heap");
+      return;
+    }
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = u64(GpuProf::kMax) * sizeof(u64);
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&gpu_prof_readback_)))) {
+      REXGPU_ERROR("GPU profiling: failed to create the readback buffer");
+      gpu_prof_heap_.Reset();
+      return;
+    }
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, static_cast<size_t>(desc.Width)};
+    if (FAILED(gpu_prof_readback_->Map(0, &read_range, &mapping))) {
+      REXGPU_ERROR("GPU profiling: failed to map the readback buffer");
+      gpu_prof_readback_.Reset();
+      gpu_prof_heap_.Reset();
+      return;
+    }
+    gpu_prof_mapping_ = static_cast<const u64*>(mapping);
+    GetD3D12Provider().GetDirectQueue()->GetTimestampFrequency(&gpu_prof_frequency_);
+  }
+  gpu_prof_.heap = gpu_prof_heap_.Get();
+  gpu_prof_.count = 0;
+  gpu_prof_.last_marked = 0xFF;
+  gpu_prof_.active = true;
+}
+
+void D3D12CommandProcessor::GpuProfEndFrame() {
+  if (!gpu_prof_.active) {
+    return;
+  }
+  // Closing timestamp, then resolve all of this frame's timestamps into the readback buffer.
+  if (gpu_prof_.count < GpuProf::kMax) {
+    const u32 index = gpu_prof_.count++;
+    gpu_prof_.cats[index] = GpuProf::kOther;
+    deferred_command_list_.D3DEndQuery(gpu_prof_.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+  }
+  gpu_prof_.active = false;
+  deferred_command_list_.D3DResolveQueryData(gpu_prof_.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                             gpu_prof_.count, gpu_prof_readback_.Get(), 0);
+  std::memcpy(gpu_prof_pending_cats_, gpu_prof_.cats, gpu_prof_.count);
+  gpu_prof_pending_count_ = gpu_prof_.count;
+  gpu_prof_pending_submission_ = submission_current_;
+  gpu_prof_pending_ = true;
+}
 
 const D3D12Settings& D3D12CommandProcessor::GetD3D12Settings() const {
   return static_cast<const D3D12XenosGraphicsDriver*>(graphics_system_)->GetD3D12Settings();
@@ -1953,6 +2078,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap([[maybe_unused]] u32 frontbuffer_ptr, u32 frontbuffer_width,
                                       u32 frontbuffer_height) {
   REX_PROFILE_SCOPE("gpu");
+  GpuProfScope gpu_prof_scope(gpu_prof_, GpuProf::kPresent);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2368,6 +2494,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
                                       [[maybe_unused]] u32 index_count,
                                       [[maybe_unused]] IndexBuffer* index_buffer_info,
                                       [[maybe_unused]] bool major_mode_explicit) {
+  GpuProfScope gpu_prof_scope(gpu_prof_, GpuProf::kDraw);
 #if REXGPU_FINE_GRAINED_DRAW_SCOPES
   REX_PROFILE_SCOPE("gpu");
 #endif  // REXGPU_FINE_GRAINED_DRAW_SCOPES
@@ -2937,6 +3064,7 @@ bool D3D12CommandProcessor::IssueDrawMemexportReadbackFastPath(u32 total_size) {
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  GpuProfScope gpu_prof_scope(gpu_prof_, GpuProf::kResolve);
 #if REXGPU_FINE_GRAINED_DRAW_SCOPES
   REX_PROFILE_SCOPE("gpu");
 #endif  // REXGPU_FINE_GRAINED_DRAW_SCOPES
@@ -3415,6 +3543,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     texture_cache_->BeginFrame();
 
+    GpuProfBeginFrame();
     shared_memory_->PrefetchHotRanges();
   }
 
@@ -3440,6 +3569,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   bool is_closing_frame = is_swap && frame_open_;
+
+  if (is_closing_frame && submission_open_) {
+    GpuProfEndFrame();
+  }
 
   if (is_closing_frame) {
     texture_cache_->EndFrame();

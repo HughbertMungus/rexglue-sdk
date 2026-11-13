@@ -1537,6 +1537,7 @@ void D3D12TextureCache::TrimRecyclePool(u64 limit_bytes) {
 
 bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, bool load_base,
                                                               bool load_mips) {
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kTexLoad);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.GetKey();
 

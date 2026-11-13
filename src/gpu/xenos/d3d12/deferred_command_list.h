@@ -26,12 +26,45 @@ namespace rex::gpu::d3d12 {
 
 class D3D12CommandProcessor;
 
+/**
+ * Sampled GPU timing (gpu.d3d12.gpu_profile_interval, bo2-bisect perf/0028). While a profiled
+ * frame is open, every GPU work command (draw, dispatch, copy, clear) recorded with a different
+ * category than the previous work command is preceded by a timestamp query; the time between
+ * consecutive timestamps is attributed to the earlier one's category.
+ */
+struct GpuProf {
+  enum : u8 { kOther = 0, kDraw, kRtTransfer, kResolve, kTexLoad, kUpload, kPresent, kCount };
+  static constexpr u32 kMax = 32768;
+  ID3D12QueryHeap* heap = nullptr;
+  bool active = false;
+  u8 category = kOther;
+  u8 last_marked = 0xFF;
+  u32 count = 0;
+  u8 cats[kMax];
+};
+
+/** Sets the GPU profiling category for the work recorded in this scope. */
+class GpuProfScope {
+ public:
+  GpuProfScope(GpuProf& prof, u8 category) : prof_(prof), previous_(prof.category) {
+    prof.category = category;
+  }
+  ~GpuProfScope() { prof_.category = previous_; }
+  GpuProfScope(const GpuProfScope&) = delete;
+  GpuProfScope& operator=(const GpuProfScope&) = delete;
+
+ private:
+  GpuProf& prof_;
+  u8 previous_;
+};
+
 class DeferredCommandList {
  public:
   DeferredCommandList(const D3D12CommandProcessor& command_processor,
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
+  void SetGpuProf(GpuProf* prof) { gpu_prof_ = prof; }
 
   /** Exchanges the recorded command streams with another list, in O(1) (async replay). */
   void SwapStream(DeferredCommandList& other) { command_stream_.swap(other.command_stream_); }
@@ -640,6 +673,7 @@ class DeferredCommandList {
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
   const D3D12CommandProcessor& command_processor_;
+  GpuProf* gpu_prof_ = nullptr;
 
   /** uintmax_t gives all structures uint64_t and pointer alignment. */
   Stream command_stream_;

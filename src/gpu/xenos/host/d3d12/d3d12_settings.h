@@ -53,6 +53,11 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, defer_guest_stores, false,
               "With upload copy workers, queue fence and scratch stores behind the pending copies "
               "instead of waiting for them");
+  REX_SETTING(i32, gpu_profile_interval, 0,
+              "Time the GPU work of every Nth frame by category (draws, render target transfers, "
+              "resolves, texture loads, uploads, present) with timestamp queries; the fps log "
+              "(REX_FPS_LOG=1) gets gp_* fields in ms per profiled frame. 0 turns it off",
+              Range{0, 1000});
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");

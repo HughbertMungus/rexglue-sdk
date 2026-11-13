@@ -53,7 +53,9 @@ namespace {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-void FpsLogTick(const std::string& tags) {
+// `tags` is called only when a line is written (once a second): it may reset per-second counters.
+template <typename TagsFn>
+void FpsLogTick(const TagsFn& tags) {
   static const bool enabled = [] {
     const char* value = std::getenv("REX_FPS_LOG");
     return value != nullptr && value[0] == '1';
@@ -80,7 +82,7 @@ void FpsLogTick(const std::string& tags) {
 #endif
     std::fprintf(file, "%02d:%02d:%02d fps=%.1f frames=%u total=%llu %s\n", tm_local.tm_hour,
                  tm_local.tm_min, tm_local.tm_sec, frames * 1000.0 / static_cast<double>(elapsed),
-                 frames, static_cast<unsigned long long>(total), tags.c_str());
+                 frames, static_cast<unsigned long long>(total), tags().c_str());
     std::fflush(file);
     frames = 0;
     window_start = now;
@@ -996,7 +998,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader,
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Each line is tagged with the switches in effect (FpsLogTags), for in-match A/B.
-  FpsLogTick(FpsLogTags());
+  FpsLogTick([this] { return FpsLogTags(); });
   if (graphics_system_) {
     graphics_system_->NotifySwap();
   }

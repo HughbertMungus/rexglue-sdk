@@ -1068,6 +1068,7 @@ void D3D12RenderTargetCache::WriteEDRAMUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache, u32& written_address_out,
                                      u32& written_length_out) {
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kResolve);
   written_address_out = 0;
   written_length_out = 0;
 
@@ -3308,6 +3309,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>* render_target_transfers,
     const u64* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kRtTransfer);
   REX_ASSERT(GetPath() == Path::kHostRenderTargets);
 
   const gpu::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
