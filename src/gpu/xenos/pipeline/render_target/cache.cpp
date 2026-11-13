@@ -345,6 +345,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   const xenos::RegisterFile& regs = GetRegisterFile();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
   last_update_msaa_4x_as_1x_ = false;
+  last_update_msaa_4x_as_1x_refused_ = false;
 
   auto rb_surface_info = regs.Get<xenos::reg::RB_SURFACE_INFO>();
   xenos::MSAASamples msaa_samples = rb_surface_info.msaa_samples;
@@ -549,7 +550,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         any_transfer_avoided = true;
       }
     }
-    if (redirect && any_transfer_avoided) {
+    if (redirect && any_transfer_avoided && !msaa_4x_as_1x_draw_eligible_) {
+      // Would redirect, but the draw is not clear-like (samples textures or reads the pixel
+      // position): drawn at twice the scale its shader would see positions it does not expect.
+      last_update_msaa_4x_as_1x_refused_ = true;
+    } else if (redirect && any_transfer_avoided) {
       for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
         rt_keys[edram_bases_sorted[i].second].msaa_samples = xenos::MSAASamples::k1X;
       }

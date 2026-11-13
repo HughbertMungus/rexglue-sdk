@@ -2596,6 +2596,11 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   u32 normalized_color_mask =
       pixel_shader ? draw_state::GetNormalizedColorMask(regs, pixel_shader->GetWritesColorTargets())
                    : 0;
+  // gpu.d3d12.msaa_4x_alias_as_1x only for clear-like draws: drawn at twice the pixel scale, a
+  // shader sampling textures or reading its pixel position would see positions it does not expect.
+  render_target_cache_->SetMsaa4xAs1xDrawEligible(
+      !pixel_shader ||
+      (pixel_shader->GetTextureBindings().empty() && ps_param_gen_pos == UINT32_MAX));
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;

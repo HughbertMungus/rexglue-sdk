@@ -150,6 +150,13 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
    * resolution scale in each direction.
    */
   bool IsLastUpdateMsaa4xAs1x() const { return last_update_msaa_4x_as_1x_; }
+  /** The last Update would have redirected, but the draw was not eligible (see below). */
+  bool IsLastUpdateMsaa4xAs1xRefused() const { return last_update_msaa_4x_as_1x_refused_; }
+  /**
+   * Set before each Update: whether the draw may be redirected - only clear-like draws (no
+   * texture sampling, no pixel position input), whose result does not depend on the pixel scale.
+   */
+  void SetMsaa4xAs1xDrawEligible(bool eligible) { msaa_4x_as_1x_draw_eligible_ = eligible; }
 
  protected:
   RenderTargetCache(const xenos::RegisterFile& register_file, const XenosSettings& settings,
@@ -608,6 +615,8 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
    */
   RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
   bool last_update_msaa_4x_as_1x_ = false;
+  bool last_update_msaa_4x_as_1x_refused_ = false;
+  bool msaa_4x_as_1x_draw_eligible_ = false;
   /**
    * Render targets of the last successful update or earlier ones, unless a different or new one
    * was bound or surface info changed, to avoid needless switching (undesirable on tile based

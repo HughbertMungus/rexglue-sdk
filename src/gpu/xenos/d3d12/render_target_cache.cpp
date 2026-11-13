@@ -66,6 +66,8 @@ struct RtxCensus {
   u64 memo_why[4] = {};
   /** 4x draws drawn into the owning 1x targets (gpu.d3d12.msaa_4x_alias_as_1x). */
   u64 msaa_4x_as_1x_draws = 0;
+  /** Draws that met the ownership condition but were not clear-like, so not redirected. */
+  u64 msaa_4x_as_1x_refused = 0;
   /** Draws per render target key: bound, and actually writing it (version change). */
   std::unordered_map<u32, std::pair<u64, u64>> draws;
   std::unordered_map<u64, RtxStat> pairs;
@@ -1045,6 +1047,9 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       const bool census = command_processor_.GetD3D12Settings().rt_transfer_census.Get();
       if (census && IsLastUpdateMsaa4xAs1x()) {
         ++g_rtx_census.msaa_4x_as_1x_draws;
+      }
+      if (census && IsLastUpdateMsaa4xAs1xRefused()) {
+        ++g_rtx_census.msaa_4x_as_1x_refused;
       }
       for (u32 i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
         if (used[i]) {
@@ -3445,11 +3450,11 @@ void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
       localtime_s(&tm_local, &t);
       std::fprintf(out,
                    "%02d:%02d:%02d frames=%llu per_frame: calls=%.1f clears=%.1f transfers=%.1f "
-                   "kpx=%.1f tiles=%.0f as1x=%.1f |",
+                   "kpx=%.1f tiles=%.0f as1x=%.1f as1x_refused=%.1f |",
                    tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
                    static_cast<unsigned long long>(frames), c.calls / fr, c.clears / fr,
                    total_n / fr, total_px / fr / 1000.0, c.tiles / fr,
-                   c.msaa_4x_as_1x_draws / fr);
+                   c.msaa_4x_as_1x_draws / fr, c.msaa_4x_as_1x_refused / fr);
       static const char* kMs[4] = {"1", "2", "4", "?"};
       for (u32 k = 0; k < 128; ++k) {
         if (!c.kinds[k].count) continue;
