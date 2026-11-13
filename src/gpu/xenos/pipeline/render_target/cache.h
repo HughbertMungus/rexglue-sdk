@@ -428,6 +428,10 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
     REX_ASSERT(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
   }
+  /** Render targets the last Update bound for the draw (index 0 depth, 1-4 colour), or null. */
+  RenderTarget* const* GetLastUpdateUsedRenderTargets() const {
+    return last_update_used_render_targets_;
+  }
   const std::vector<Transfer>* GetLastUpdateTransfers() const {
     REX_ASSERT(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;

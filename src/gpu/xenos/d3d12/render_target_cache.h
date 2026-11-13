@@ -216,7 +216,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
           descriptor_load_separate_(std::move(descriptor_load_separate)),
           descriptor_srv_(std::move(descriptor_srv)),
           descriptor_srv_stencil_(std::move(descriptor_srv_stencil)),
-          resource_state_(resource_state) {}
+          resource_state_(resource_state),
+          write_version_(NextWriteVersion()) {}
+
+    /**
+     * Unique number that changes whenever the contents may change: a draw writing it, a clear,
+     * or a transfer into it (gpu.d3d12.rt_transfer_memo). Never reused, even across targets.
+     */
+    u64 GetWriteVersion() const { return write_version_; }
+    void MarkWritten() { write_version_ = NextWriteVersion(); }
+    static u64 NextWriteVersion() {
+      static u64 counter = 0;
+      return ++counter;
+    }
 
     ID3D12Resource* GetResource() const { return resource_.Get(); }
     const gpu::d3d12::D3D12CPUDescriptorPool::Descriptor& GetDescriptorDraw() const {
@@ -257,6 +269,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     gpu::d3d12::D3D12CPUDescriptorPool::Descriptor descriptor_srv_;
     gpu::d3d12::D3D12CPUDescriptorPool::Descriptor descriptor_srv_stencil_;
     D3D12_RESOURCE_STATES resource_state_;
+    u64 write_version_;
     /** Temporary storage for indices in transfers and dumps. */
     u32 temporary_srv_descriptor_index_ = UINT32_MAX;
     u32 temporary_srv_descriptor_index_stencil_ = UINT32_MAX;

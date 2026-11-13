@@ -45,6 +45,56 @@
 
 namespace rex::gpu::d3d12 {
 
+namespace {
+// Render target transfer census (gpu.d3d12.rt_transfer_census, after bo2-bisect perf/0045).
+// Kind = src depth | dst depth << 1 | host depth source << 2 | src MSAA log2 << 3 |
+// dst MSAA log2 << 5. Pixels are guest (unscaled) pixels of the transferred rectangles.
+// Pairs are keyed by the source and destination RenderTargetKey (EDRAM base, pitch, MSAA,
+// format) - the same pair every frame is the same two host render targets.
+struct RtxStat {
+  u64 count = 0;
+  u64 pixels = 0;
+};
+struct RtxCensus {
+  u64 calls = 0;
+  u64 clears = 0;
+  u64 tiles = 0;
+  RtxStat kinds[128];
+  /** Transfers the memo found redundant (skipped with gpu.d3d12.rt_transfer_memo). */
+  RtxStat memo_kinds[128];
+  /** Why the others were not: no record of the pair on that range, source / dest / both written. */
+  u64 memo_why[4] = {};
+  /** Draws per render target key: bound, and actually writing it (version change). */
+  std::unordered_map<u32, std::pair<u64, u64>> draws;
+  std::unordered_map<u64, RtxStat> pairs;
+};
+RtxCensus g_rtx_census;
+
+// Transfer memo (gpu.d3d12.rt_transfer_memo): after a transfer between two render targets on a
+// tile range, both hold the same data there until either is written (write versions). Keyed by
+// the unordered target pair and the range; the value is both write versions after that transfer.
+struct RtxMemoKey {
+  const void* a;
+  const void* b;
+  u32 start_tiles;
+  u32 end_tiles;
+  bool operator==(const RtxMemoKey&) const = default;
+};
+struct RtxMemoKeyHash {
+  size_t operator()(const RtxMemoKey& k) const {
+    u64 h = reinterpret_cast<uintptr_t>(k.a) * 0x9E3779B97F4A7C15ull;
+    h ^= reinterpret_cast<uintptr_t>(k.b) * 0xC2B2AE3D27D4EB4Full;
+    h ^= (static_cast<u64>(k.start_tiles) << 32) | k.end_tiles;
+    return static_cast<size_t>(h ^ (h >> 29));
+  }
+};
+struct RtxMemoValue {
+  u64 version_a;
+  u64 version_b;
+};
+std::unordered_map<RtxMemoKey, RtxMemoValue, RtxMemoKeyHash> g_rtx_memo;
+}  // namespace
+
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/clear_uint2_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
@@ -986,6 +1036,54 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, GetLastUpdateTransfers());
       SetCommandListRenderTargets(depth_and_color_render_targets);
+      // Write versions (gpu.d3d12.rt_transfer_memo): the draw writes every bound colour target
+      // (bound only with a non-zero write mask) and the depth target only with depth writes or
+      // stencil operations that can change the buffer.
+      RenderTarget* const* used = GetLastUpdateUsedRenderTargets();
+      const bool census = command_processor_.GetD3D12Settings().rt_transfer_census.Get();
+      for (u32 i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (used[i]) {
+          static_cast<D3D12RenderTarget*>(used[i])->MarkWritten();
+          if (census) {
+            auto& d = g_rtx_census.draws[used[i]->GetKey().key];
+            ++d.first;
+            ++d.second;
+          }
+        }
+      }
+      if (used[0]) {
+        bool depth_written = normalized_depth_control.z_enable &&
+                             normalized_depth_control.z_write_enable;
+        if (!depth_written && normalized_depth_control.stencil_enable) {
+          const xenos::RegisterFile& regs = GetRegisterFile();
+          auto ops_write = [](xenos::StencilOp fail, xenos::StencilOp zpass,
+                              xenos::StencilOp zfail) {
+            return fail != xenos::StencilOp::kKeep || zpass != xenos::StencilOp::kKeep ||
+                   zfail != xenos::StencilOp::kKeep;
+          };
+          if (regs.Get<xenos::reg::RB_STENCILREFMASK>().stencilwritemask &&
+              ops_write(normalized_depth_control.stencilfail, normalized_depth_control.stencilzpass,
+                        normalized_depth_control.stencilzfail)) {
+            depth_written = true;
+          }
+          if (normalized_depth_control.backface_enable &&
+              regs.Get<xenos::reg::RB_STENCILREFMASK>(xenos::Register::RB_STENCILREFMASK_BF)
+                  .stencilwritemask &&
+              ops_write(normalized_depth_control.stencilfail_bf,
+                        normalized_depth_control.stencilzpass_bf,
+                        normalized_depth_control.stencilzfail_bf)) {
+            depth_written = true;
+          }
+        }
+        if (depth_written) {
+          static_cast<D3D12RenderTarget*>(used[0])->MarkWritten();
+        }
+        if (census) {
+          auto& d = g_rtx_census.draws[used[0]->GetKey().key];
+          ++d.first;
+          d.second += depth_written ? 1 : 0;
+        }
+      }
     } break;
     case Path::kPixelShaderInterlock: {
       TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3309,25 +3407,6 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
-namespace {
-// Render target transfer census (gpu.d3d12.rt_transfer_census, after bo2-bisect perf/0045).
-// Kind = src depth | dst depth << 1 | host depth source << 2 | src MSAA log2 << 3 |
-// dst MSAA log2 << 5. Pixels are guest (unscaled) pixels of the transferred rectangles.
-// Pairs are keyed by the source and destination RenderTargetKey (EDRAM base, pitch, MSAA,
-// format) - the same pair every frame is the same two host render targets.
-struct RtxStat {
-  u64 count = 0;
-  u64 pixels = 0;
-};
-struct RtxCensus {
-  u64 calls = 0;
-  u64 clears = 0;
-  u64 tiles = 0;
-  RtxStat kinds[128];
-  std::unordered_map<u64, RtxStat> pairs;
-};
-RtxCensus g_rtx_census;
-}  // namespace
 
 void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
   // d|c, width in pixels x MSAA samples, @ EDRAM base tile, format.
@@ -3367,6 +3446,14 @@ void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
                      (k & 2) ? "d" : "c", kMs[(k >> 5) & 3], (k & 4) ? "+hd" : "",
                      c.kinds[k].count / fr, c.kinds[k].pixels / fr / 1000.0);
       }
+      std::fprintf(out, " | memo_miss(none/src/dst/both)=%.1f/%.1f/%.1f/%.1f memo_same:",
+                   c.memo_why[0] / fr, c.memo_why[1] / fr, c.memo_why[2] / fr, c.memo_why[3] / fr);
+      for (u32 k = 0; k < 128; ++k) {
+        if (!c.memo_kinds[k].count) continue;
+        std::fprintf(out, " %s%s>%s%s%s:%.1f/%.0fk", (k & 1) ? "d" : "c", kMs[(k >> 3) & 3],
+                     (k & 2) ? "d" : "c", kMs[(k >> 5) & 3], (k & 4) ? "+hd" : "",
+                     c.memo_kinds[k].count / fr, c.memo_kinds[k].pixels / fr / 1000.0);
+      }
       std::vector<std::pair<u64, RtxStat>> pairs(c.pairs.begin(), c.pairs.end());
       std::sort(pairs.begin(), pairs.end(),
                 [](const auto& a, const auto& b) { return a.second.pixels > b.second.pixels; });
@@ -3376,6 +3463,14 @@ void D3D12RenderTargetCache::RtxCensusWrite(u64 frames) {
         const u32 dst = static_cast<u32>(pairs[i].first);
         std::fprintf(out, " %s>%s:%.1f/%.0fk", RtxKeyText(src).c_str(), RtxKeyText(dst).c_str(),
                      pairs[i].second.count / fr, pairs[i].second.pixels / fr / 1000.0);
+      }
+      std::vector<std::pair<u32, std::pair<u64, u64>>> draws(c.draws.begin(), c.draws.end());
+      std::sort(draws.begin(), draws.end(),
+                [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+      std::fprintf(out, " | draws(bound/writing):");
+      for (size_t i = 0; i < draws.size() && i < 16; ++i) {
+        std::fprintf(out, " %s:%.1f/%.1f", RtxKeyText(draws[i].first).c_str(),
+                     draws[i].second.first / fr, draws[i].second.second / fr);
       }
       std::fprintf(out, "\n");
       std::fflush(out);
@@ -3429,6 +3524,90 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     }
     if (any) ++g_rtx_census.calls;
     if (resolve_clear_needed) ++g_rtx_census.clears;
+  }
+  // Transfer memo: drop transfers between two targets that already hold the same data on the
+  // range, then record the remaining ones. Every transfer into a target and every clear changes
+  // its write version, whether or not the memo is on, so no stale record can match later.
+  std::vector<Transfer> memo_kept[1 + xenos::kMaxColorRenderTargets];
+  if (render_target_transfers && render_target_count <= 1 + xenos::kMaxColorRenderTargets) {
+    const bool memo_skip = command_processor_.GetD3D12Settings().rt_transfer_memo.Get();
+    const bool memo_track =
+        memo_skip || command_processor_.GetD3D12Settings().rt_transfer_census.Get();
+    auto memo_key = [](const RenderTarget* x, const RenderTarget* y, const Transfer& t) {
+      return x < y ? RtxMemoKey{x, y, t.start_tiles, t.end_tiles}
+                   : RtxMemoKey{y, x, t.start_tiles, t.end_tiles};
+    };
+    bool any_skipped = false;
+    if (memo_track && !resolve_clear_needed) {
+      for (u32 i = 0; i < render_target_count; ++i) {
+        auto* dst = static_cast<D3D12RenderTarget*>(render_targets[i]);
+        if (!dst) continue;
+        for (const Transfer& t : render_target_transfers[i]) {
+          bool same = false;
+          if (!t.host_depth_source) {
+            auto* src = static_cast<D3D12RenderTarget*>(t.source);
+            auto it = g_rtx_memo.find(memo_key(src, dst, t));
+            if (it != g_rtx_memo.end()) {
+              const bool src_first = static_cast<const void*>(src) < static_cast<const void*>(dst);
+              const u64 vs = src_first ? it->second.version_a : it->second.version_b;
+              const u64 vd = src_first ? it->second.version_b : it->second.version_a;
+              const bool src_changed = vs != src->GetWriteVersion();
+              const bool dst_changed = vd != dst->GetWriteVersion();
+              same = !src_changed && !dst_changed;
+              if (!same) {
+                ++g_rtx_census.memo_why[(src_changed ? 1 : 0) + (dst_changed ? 2 : 0)];
+              }
+            } else {
+              ++g_rtx_census.memo_why[0];
+            }
+          }
+          if (same) {
+            const RenderTargetKey sk = t.source->GetKey();
+            const RenderTargetKey dk = dst->GetKey();
+            const u32 kind = static_cast<u32>(sk.is_depth) | (static_cast<u32>(dk.is_depth) << 1) |
+                             (static_cast<u32>(sk.msaa_samples) << 3) |
+                             (static_cast<u32>(dk.msaa_samples) << 5);
+            RtxStat& ms = g_rtx_census.memo_kinds[kind & 127];
+            ++ms.count;
+            ms.pixels += static_cast<u64>(t.end_tiles - t.start_tiles) * xenos::kEDRAMTileWidthSamples *
+                         xenos::kEDRAMTileHeightSamples;
+            if (memo_skip) {
+              any_skipped = true;
+              continue;
+            }
+          }
+          memo_kept[i].push_back(t);
+        }
+      }
+      if (any_skipped) {
+        render_target_transfers = memo_kept;
+      }
+    }
+    if (g_rtx_memo.size() > 8192) {
+      g_rtx_memo.clear();
+    }
+    for (u32 i = 0; i < render_target_count; ++i) {
+      auto* dst = static_cast<D3D12RenderTarget*>(render_targets[i]);
+      if (!dst) continue;
+      for (const Transfer& t : render_target_transfers[i]) {
+        dst->MarkWritten();
+        if (memo_track && !t.host_depth_source && !resolve_clear_needed) {
+          auto* src = static_cast<D3D12RenderTarget*>(t.source);
+          const bool src_first = static_cast<const void*>(src) < static_cast<const void*>(dst);
+          const u64 vs = src->GetWriteVersion();
+          const u64 vd = dst->GetWriteVersion();
+          g_rtx_memo[memo_key(src, dst, t)] =
+              src_first ? RtxMemoValue{vs, vd} : RtxMemoValue{vd, vs};
+        }
+      }
+    }
+  }
+  if (resolve_clear_needed) {
+    for (u32 i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        static_cast<D3D12RenderTarget*>(render_targets[i])->MarkWritten();
+      }
+    }
   }
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {

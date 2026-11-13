@@ -61,6 +61,10 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, rt_transfer_census, false,
               "Count render target ownership transfers by kind and by source -> destination render "
               "target, one line a second in mp_rtx.txt (needs REX_FPS_LOG=1)");
+  REX_SETTING(bool, rt_transfer_memo, false,
+              "Skip a render target transfer when its source and destination already hold the "
+              "same data on that range: the last transfer between them on it, either way, was "
+              "followed by no draw writing, clear or other transfer into either one");
   REX_SETTING(bool, submit_on_primary_buffer_end, true,
               "Submit command list when PM4 primary buffer ends");
   REX_SETTING(bool, dxbc_disasm, false, "Dump DXBC disassembly");
