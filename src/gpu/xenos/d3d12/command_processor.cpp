@@ -2596,11 +2596,47 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   u32 normalized_color_mask =
       pixel_shader ? draw_state::GetNormalizedColorMask(regs, pixel_shader->GetWritesColorTargets())
                    : 0;
-  // gpu.d3d12.msaa_4x_alias_as_1x only for clear-like draws: drawn at twice the pixel scale, a
-  // shader sampling textures or reading its pixel position would see positions it does not expect.
-  render_target_cache_->SetMsaa4xAs1xDrawEligible(
-      !pixel_shader ||
-      (pixel_shader->GetTextureBindings().empty() && ps_param_gen_pos == UINT32_MAX));
+  // gpu.d3d12.msaa_4x_alias_as_1x only for clear-like draws, whose result does not depend on how
+  // they are rasterized: no texture sampling or pixel position input (drawn at twice the pixel
+  // scale, the shader would see positions it does not expect), and every covered sample simply
+  // overwritten - depth and stencil tests always pass, no blending, no alpha test or alpha to mask.
+  // Untextured geometry such as stencil light volumes tests depth and is excluded.
+  {
+    bool clear_like =
+        !pixel_shader ||
+        (pixel_shader->GetTextureBindings().empty() && ps_param_gen_pos == UINT32_MAX);
+    if (normalized_depth_control.z_enable &&
+        normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
+      clear_like = false;
+    }
+    if (normalized_depth_control.stencil_enable &&
+        (normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+         (normalized_depth_control.backface_enable &&
+          normalized_depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways))) {
+      clear_like = false;
+    }
+    auto rb_colorcontrol = regs.Get<xenos::reg::RB_COLORCONTROL>();
+    if (normalized_color_mask &&
+        (rb_colorcontrol.alpha_test_enable || rb_colorcontrol.alpha_to_mask_enable)) {
+      clear_like = false;
+    }
+    for (u32 i = 0; clear_like && i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!((normalized_color_mask >> (4 * i)) & 0b1111)) {
+        continue;
+      }
+      auto blend = regs.Get<xenos::reg::RB_BLENDCONTROL>(
+          xenos::reg::RB_BLENDCONTROL::kRTRegisterIndices[i]);
+      if (blend.color_srcblend != xenos::BlendFactor::kOne ||
+          blend.color_destblend != xenos::BlendFactor::kZero ||
+          blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+          blend.alpha_srcblend != xenos::BlendFactor::kOne ||
+          blend.alpha_destblend != xenos::BlendFactor::kZero ||
+          blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+        clear_like = false;
+      }
+    }
+    render_target_cache_->SetMsaa4xAs1xDrawEligible(clear_like);
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
