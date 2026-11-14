@@ -532,6 +532,20 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   u32 texture_bindings_in_sync_ = 0;
+
+  /** Bumped when a texture used in the current frame is destroyed (see GetTextureDestroyEpoch). */
+  u64 texture_destroy_epoch_ = 0;
+  /** current_submission_index_ at BeginFrame: textures used at or after it were used this frame. */
+  u64 frame_first_submission_index_ = 0;
+
+ public:
+  /**
+   * Changes whenever a texture used in the current frame (or all textures) was destroyed. A
+   * texture recreated under the same key gets new
+   * descriptors, so descriptors the driver cached by texture key must be rewritten when this
+   * changes, even if the keys still match.
+   */
+  u64 GetTextureDestroyEpoch() const { return texture_destroy_epoch_; }
 };
 
 }  // namespace rex::gpu

@@ -4470,6 +4470,27 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
 
   REX_ASSERT(sampler_count_vertex + sampler_count_pixel <= kSamplerHeapSize);
 
+  // Texture descriptors are cached by texture key, but a texture destroyed (evicted mid-frame) and
+  // recreated under the same key has new descriptors - the old ones are freed and may be reused.
+  const u64 texture_destroy_epoch = texture_cache_->GetTextureDestroyEpoch();
+  if (texture_destroy_epoch_seen_ != texture_destroy_epoch) {
+    texture_destroy_epoch_seen_ = texture_destroy_epoch;
+    bool any_written;
+    if (bindless_resources_used_) {
+      any_written = cbuffer_binding_descriptor_indices_vertex_.up_to_date ||
+                    cbuffer_binding_descriptor_indices_pixel_.up_to_date;
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+    } else {
+      any_written = bindful_textures_written_vertex_ || bindful_textures_written_pixel_;
+      bindful_textures_written_vertex_ = false;
+      bindful_textures_written_pixel_ = false;
+    }
+    if (any_written) {
+      texture_descriptor_rewrites_after_destroy_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   if (bindless_resources_used_) {
     if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
         (current_texture_layout_uid_vertex_ != texture_layout_uid_vertex ||

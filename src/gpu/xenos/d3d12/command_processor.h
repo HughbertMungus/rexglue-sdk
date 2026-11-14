@@ -261,6 +261,8 @@ class D3D12CommandProcessor : public CommandProcessor {
            " ds=" + std::to_string(GetD3D12Settings().defer_guest_stores.Get() ? 1 : 0) +
            " fd=" + std::to_string(GetD3D12Settings().fetch_dedup.Get() ? 1 : 0) +
            " rc=" + std::to_string(GetD3D12Settings().texture_recycle_pool_mb.Get()) +
+           " tdr=" +
+           std::to_string(texture_descriptor_rewrites_after_destroy_.load(std::memory_order_relaxed)) +
            GpuProfLogTags();
   }
   /** gp_* fields (ms per profiled frame by category) while GPU profiling is on; resets them. */
@@ -769,6 +771,11 @@ class D3D12CommandProcessor : public CommandProcessor {
    * bindful_#_written_#_ (bindful) or cbuffer_binding_descriptor_indices_#_.up_to_date (bindless)
    * is true.
    */
+  // Texture cache destroy epoch the texture descriptors were last written for (UpdateBindings).
+  u64 texture_destroy_epoch_seen_ = 0;
+  // tdr= in mp_fps.txt (cumulative): descriptor rewrites forced because written descriptors may
+  // have referenced a destroyed texture. Non-zero means the stale-descriptor case really happened.
+  std::atomic<u64> texture_descriptor_rewrites_after_destroy_{0};
   size_t current_texture_layout_uid_vertex_;
   size_t current_texture_layout_uid_pixel_;
   size_t current_sampler_layout_uid_vertex_;

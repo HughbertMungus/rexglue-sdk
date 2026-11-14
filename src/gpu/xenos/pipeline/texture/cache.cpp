@@ -112,6 +112,11 @@ void TextureCache::CompletedSubmissionUpdated(u64 completed_submission_index) {
       // Bindings may reference the destroyed texture, so reset them.
       ResetTextureBindings();
     }
+    // Descriptors written this frame only reference textures used this frame (bindings are reset
+    // at BeginFrame and every bound texture is marked as used), so only those make them stale.
+    if (texture->GetLastUsageSubmissionIndex() >= frame_first_submission_index_) {
+      ++texture_destroy_epoch_;
+    }
     OnTextureEvicted(*texture);
     auto found_texture_it = textures_.find(texture->GetKey());
     REX_ASSERT(found_texture_it != textures_.end());
@@ -132,6 +137,7 @@ void TextureCache::BeginSubmission(u64 new_submission_index) {
 }
 
 void TextureCache::BeginFrame() {
+  frame_first_submission_index_ = current_submission_index_;
   ResetTextureBindings();
 }
 
@@ -563,6 +569,7 @@ void TextureCache::WatchCallback(void* context, [[maybe_unused]] void* data, u64
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
+  ++texture_destroy_epoch_;
   ResetTextureBindings(from_destructor);
   textures_.clear();
   REX_PROFILE_PLOT("gpu/texture_cache/textures", 0);
