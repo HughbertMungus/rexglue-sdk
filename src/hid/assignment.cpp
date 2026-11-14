@@ -25,6 +25,7 @@ void AssignOrdinals(const std::vector<Device>& previous, std::vector<Device>& se
       fresh[i] = true;
     }
   }
+  const std::vector<bool> connected_now = fresh;
 
   auto taken = [&](u32 candidate) {
     for (size_t j = 0; j < seen.size(); ++j) {
@@ -60,6 +61,26 @@ void AssignOrdinals(const std::vector<Device>& previous, std::vector<Device>& se
       seen[i].ordinal = ordinal;
     }
     fresh[i] = false;
+  }
+
+  // A real pad connecting after stand-in pads (PadDevice::yields_slot) took the low slots swaps
+  // with the lowest of them below it, so e.g. a streamed pad that appears after launch is player 1.
+  for (size_t i = 0; i < seen.size(); ++i) {
+    if (!connected_now[i] || seen[i].synthetic || seen[i].pad.yields_slot) {
+      continue;
+    }
+    size_t lowest = seen.size();
+    for (size_t j = 0; j < seen.size(); ++j) {
+      if (seen[j].synthetic || !seen[j].pad.yields_slot || seen[j].ordinal >= seen[i].ordinal) {
+        continue;
+      }
+      if (lowest == seen.size() || seen[j].ordinal < seen[lowest].ordinal) {
+        lowest = j;
+      }
+    }
+    if (lowest != seen.size()) {
+      std::swap(seen[i].ordinal, seen[lowest].ordinal);
+    }
   }
 
   std::ranges::stable_sort(seen,

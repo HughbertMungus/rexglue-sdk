@@ -133,6 +133,11 @@ struct PadDevice {
   std::string name;
   PadInfo info;
   PadIdentity identity;
+  /**
+   * A stand-in pad (e.g. an app's virtual pads): a real pad that connects later takes the lowest
+   * user slot such a pad holds below its own, and the stand-in moves to the real pad's slot.
+   */
+  bool yields_slot = false;
 };
 
 }  // namespace rex::hid
