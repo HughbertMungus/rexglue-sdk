@@ -47,6 +47,14 @@ class D3D12TextureCache final : public TextureCache {
                              D3D12CommandProcessor& command_processor,
                              bool bindless_resources_used);
 
+  /**
+   * Diagnostics (cumulative, fps log tnl= / tod=): textures bound for a draw whose level 0 was
+   * never loaded (their resource holds uninitialised or recycled memory), and textures bound while
+   * still outdated after the request (sampled with stale data).
+   */
+  u64 GetUnloadedTextureBinds() const { return unloaded_texture_binds_.load(std::memory_order_relaxed); }
+  u64 GetOutdatedTextureBinds() const { return outdated_texture_binds_.load(std::memory_order_relaxed); }
+
   struct TextureSRVKey {
     TextureKey key;
     u32 host_swizzle;
@@ -295,6 +303,11 @@ class D3D12TextureCache final : public TextureCache {
   void OnTextureEvicted(Texture& texture) override;
   void TrimRecyclePool(u64 limit_bytes);
   /** Front is the oldest. */
+  std::atomic<u64> unloaded_texture_binds_{0};
+  std::atomic<u64> outdated_texture_binds_{0};
+  u32 unloaded_texture_binds_logged_ = 0;
+  void CheckBoundTextureLoaded(const Texture& texture, u32 fetch_constant_index);
+
   std::list<RecycledResource> recycle_lru_;
   std::unordered_map<RecycleKey, std::vector<std::list<RecycledResource>::iterator>,
                      RecycleKey::Hasher>
@@ -330,6 +343,8 @@ class D3D12TextureCache final : public TextureCache {
      */
     void Refresh3DAs2DResource();
     void BumpBaseLoadGeneration() { ++base_load_generation_; }
+    /** How many times level 0 was loaded; 0 means its data never reached the resource. */
+    u64 GetBaseLoadGeneration() const { return base_load_generation_; }
 
     explicit D3D12Texture(D3D12TextureCache& texture_cache, const TextureKey& key,
                           ID3D12Resource* resource, D3D12_RESOURCE_STATES resource_state,

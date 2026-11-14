@@ -35,6 +35,23 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, async_replay, false,
               "Record, execute and signal closed submissions on a separate GPU Replay thread "
               "instead of the GPU command thread");
+  REX_SETTING(bool, async_replay_wait, false,
+              "Diagnostic: with async replay, wait after each submission until the replay thread "
+              "has executed it, so the two threads never run at the same time");
+  REX_SETTING(i32, async_replay_guard, 0,
+              "Diagnostic: with async replay, wait for the replay thread before some command thread "
+              "work - 1 creating textures, 2 creating texture descriptors, 4 render target transfers "
+              "and clears, 8 shared memory uploads, 16 loading texture data",
+              Range{0, 31});
+  // 18 = texture data loads (16) + texture descriptor creation (2): with async replay, the NVIDIA
+  // driver (GTX 1050 Ti) corrupted textures (red/green static) when these wrote descriptors while
+  // the replay thread recorded or submitted a command list. Bit 8 must stay off: shared memory
+  // uploads may wait for the replay queue (tile mappings) and would deadlock.
+  REX_SETTING(i32, async_replay_lock, 18,
+              "With async replay, keep this command thread work (async_replay_guard bits) from "
+              "running while the replay thread records and submits a command list. The default "
+              "covers texture loads and texture descriptors (NVIDIA static otherwise)",
+              Range{0, 31});
   REX_SETTING(i32, upload_copy_workers, 0,
               "Threads that copy guest memory into upload buffers off the GPU command thread, 0 "
               "copies inline. Command lists and guest-visible writes wait for the queued copies",

@@ -408,6 +408,9 @@ bool D3D12SharedMemory::UploadRanges(const std::vector<std::pair<u32, u32>>& upl
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // No LockAsyncReplay(8) here: uploads may wait for the replay queue (tile mappings), which would
+  // deadlock with the replay thread waiting for the lock.
+  command_processor_.GuardAsyncReplay(8);
   if (!prefetching_) {
     // Demand uploads feed the next frames' prefetch.
     auto& hot = hot_ranges_[hot_frame_];

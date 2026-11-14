@@ -9,7 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cstdlib>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/logging/log_category.h>
@@ -310,6 +315,40 @@ bool D3D12Provider::Initialize(i32 adapter_index_wanted) {
     if (settings_->break_on_warning.Get()) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
     }
+    if (debug) {
+      // The debug layer only prints to an attached debugger: copy its messages into the log (each
+      // message ID in full the first 8 times, then counted), so a normal launch keeps them.
+      d3d12_info_queue->AddRef();
+      std::thread([d3d12_info_queue]() {
+        std::unordered_map<int, u64> seen;
+        std::vector<u8> buffer;
+        while (true) {
+          UINT64 count = d3d12_info_queue->GetNumStoredMessages();
+          for (UINT64 i = 0; i < count; ++i) {
+            SIZE_T length = 0;
+            if (FAILED(d3d12_info_queue->GetMessage(i, nullptr, &length)) || !length) {
+              continue;
+            }
+            buffer.resize(length);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+            if (FAILED(d3d12_info_queue->GetMessage(i, message, &length))) {
+              continue;
+            }
+            u64 n = ++seen[static_cast<int>(message->ID)];
+            if (n <= 8 || (n & (n - 1)) == 0) {
+              REXGPU_WARN("D3D12 debug layer [sev {} id {} x{}]: {}",
+                          static_cast<int>(message->Severity), static_cast<int>(message->ID), n,
+                          std::string_view(message->pDescription,
+                                           message->DescriptionByteLength
+                                               ? message->DescriptionByteLength - 1
+                                               : 0));
+            }
+          }
+          d3d12_info_queue->ClearStoredMessages();
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+      }).detach();
+    }
     d3d12_info_queue->Release();
   }
 
@@ -363,8 +402,20 @@ bool D3D12Provider::Initialize(i32 adapter_index_wanted) {
   // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED requires Windows 10 2004 (ID3D12Device8 or OPTIONS7).
   heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_NONE;
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
-  if (SUCCEEDED(
-          device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7)))) {
+  // REX_D3D12_ZERO_NEW_RESOURCES=1 (diagnostic): let the driver zero every new resource and heap,
+  // so anything read before it is written shows as zeros (as on AMD) instead of old VRAM contents.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  const char* zero_new_resources = std::getenv("REX_D3D12_ZERO_NEW_RESOURCES");
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+  if (zero_new_resources != nullptr && zero_new_resources[0] == '1') {
+    REXGPU_INFO("REX_D3D12_ZERO_NEW_RESOURCES=1: new resources and heaps are zeroed");
+  } else if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7,
+                                                   sizeof(options7)))) {
     heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
   }
   ps_specified_stencil_reference_supported_ = false;

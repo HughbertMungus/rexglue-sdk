@@ -3514,6 +3514,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle) {
   GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kRtTransfer);
   REX_ASSERT(GetPath() == Path::kHostRenderTargets);
+  std::unique_lock<std::mutex> replay_lock;
+  {
+    bool any_work = render_target_resolve_clear_values != nullptr;
+    for (u32 i = 0; !any_work && render_target_transfers && i < render_target_count; ++i) {
+      any_work = !render_target_transfers[i].empty();
+    }
+    if (any_work) {
+      command_processor_.GuardAsyncReplay(4);
+      replay_lock = command_processor_.LockAsyncReplay(4);
+    }
+  }
 
   const gpu::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();

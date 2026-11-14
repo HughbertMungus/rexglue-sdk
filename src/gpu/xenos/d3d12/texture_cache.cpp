@@ -699,6 +699,7 @@ void D3D12TextureCache::RequestTextures(u32 used_texture_mask) {
     }
     D3D12Texture* binding_texture = static_cast<D3D12Texture*>(binding->texture);
     if (binding_texture != nullptr) {
+      CheckBoundTextureLoaded(*binding_texture, index);
       binding_texture->MarkAsUsed();
       command_processor_.PushTransitionBarrier(
           binding_texture->GetResource(),
@@ -709,6 +710,7 @@ void D3D12TextureCache::RequestTextures(u32 used_texture_mask) {
     }
     D3D12Texture* binding_texture_signed = static_cast<D3D12Texture*>(binding->texture_signed);
     if (binding_texture_signed != nullptr) {
+      CheckBoundTextureLoaded(*binding_texture_signed, index);
       binding_texture_signed->MarkAsUsed();
       command_processor_.PushTransitionBarrier(
           binding_texture_signed->GetResource(),
@@ -717,6 +719,26 @@ void D3D12TextureCache::RequestTextures(u32 used_texture_mask) {
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+  }
+}
+
+void D3D12TextureCache::CheckBoundTextureLoaded(const Texture& texture,
+                                                u32 fetch_constant_index) {
+  const TextureKey& key = texture.GetKey();
+  if (key.base_page != 0 &&
+      static_cast<const D3D12Texture&>(texture).GetBaseLoadGeneration() == 0) {
+    unloaded_texture_binds_.fetch_add(1, std::memory_order_relaxed);
+    if (unloaded_texture_binds_logged_ < 32) {
+      ++unloaded_texture_binds_logged_;
+      REXGPU_WARN(
+          "Texture bound before its data was loaded: fetch {} {}{}x{}x{} {} base 0x{:08X} mips "
+          "0x{:08X} outdated {}",
+          fetch_constant_index, key.scaled_resolve ? "scaled " : "", key.GetWidth(),
+          key.GetHeight(), key.GetDepthOrArraySize(), xenos::FormatInfo::Get(key.format)->name,
+          key.base_page << 12, key.mip_page << 12, texture.GetOutdatedMask());
+    }
+  } else if (texture.GetOutdatedMask() != 0) {
+    outdated_texture_binds_.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -1437,6 +1459,8 @@ u32 D3D12TextureCache::GetMaxHostTextureDepthOrArraySize(xenos::DataDimension di
 }
 
 std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureKey key) {
+  command_processor_.GuardAsyncReplay(1);
+  auto replay_lock = command_processor_.LockAsyncReplay(1);
   D3D12_RESOURCE_DESC desc;
   desc.Format = GetDXGIResourceFormat(key);
   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
@@ -1538,6 +1562,8 @@ void D3D12TextureCache::TrimRecyclePool(u64 limit_bytes) {
 bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, bool load_base,
                                                               bool load_mips) {
   GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kTexLoad);
+  command_processor_.GuardAsyncReplay(16);
+  auto replay_lock = command_processor_.LockAsyncReplay(16);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.GetKey();
 
@@ -2050,6 +2076,8 @@ u32 D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
     return existing_descriptor_index;
   }
   REX_PERF_INC("texture_cache_misses");
+  command_processor_.GuardAsyncReplay(2);
+  auto replay_lock = command_processor_.LockAsyncReplay(2);
 
   TextureKey texture_key = texture.GetKey();
 

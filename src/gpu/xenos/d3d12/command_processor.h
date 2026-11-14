@@ -82,6 +82,22 @@ class D3D12CommandProcessor : public CommandProcessor {
    * directly (not through a submission) calls this first to keep queue order.
    */
   void FlushAsyncReplay();
+  /** gpu.d3d12.async_replay_guard (diagnostic): waits for the replay thread if `bit` is set. */
+  void GuardAsyncReplay(u32 bit) {
+    if (replay_active_ && (static_cast<u32>(GetD3D12Settings().async_replay_guard.Get()) & bit)) {
+      FlushAsyncReplay();
+    }
+  }
+  /**
+   * gpu.d3d12.async_replay_lock (diagnostic): while the returned lock is held, the replay thread
+   * does not record or submit a command list (it holds the same mutex while it does).
+   */
+  [[nodiscard]] std::unique_lock<std::mutex> LockAsyncReplay(u32 bit) {
+    if (replay_active_ && (static_cast<u32>(GetD3D12Settings().async_replay_lock.Get()) & bit)) {
+      return std::unique_lock<std::mutex>(replay_record_mutex_);
+    }
+    return {};
+  }
   u64 GetCompletedSubmission() const { return submission_completed_; }
 
   /**
@@ -263,8 +279,11 @@ class D3D12CommandProcessor : public CommandProcessor {
            " rc=" + std::to_string(GetD3D12Settings().texture_recycle_pool_mb.Get()) +
            " tdr=" +
            std::to_string(texture_descriptor_rewrites_after_destroy_.load(std::memory_order_relaxed)) +
+           TextureBindDiagnosticTags() +
            GpuProfLogTags();
   }
+  /** tnl= / tod= (cumulative): textures bound never loaded / still outdated (texture cache). */
+  std::string TextureBindDiagnosticTags() const;
   /** gp_* fields (ms per profiled frame by category) while GPU profiling is on; resets them. */
   std::string GpuProfLogTags() const;
 
@@ -520,6 +539,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool replay_presenter_hooked_ = false;
   std::thread replay_thread_;
   std::mutex replay_mutex_;
+  /** Held by the replay thread while it records and submits (async_replay_lock). */
+  std::mutex replay_record_mutex_;
   std::condition_variable replay_cv_;
   std::deque<ReplayJob> replay_queue_;
   bool replay_busy_ = false;

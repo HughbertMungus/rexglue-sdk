@@ -71,6 +71,14 @@ std::atomic<u64> g_gpu_prof_frames{0};
 std::atomic<u64> g_gpu_prof_marks{0};
 }  // namespace
 
+std::string D3D12CommandProcessor::TextureBindDiagnosticTags() const {
+  if (!texture_cache_) {
+    return {};
+  }
+  return " tnl=" + std::to_string(texture_cache_->GetUnloadedTextureBinds()) +
+         " tod=" + std::to_string(texture_cache_->GetOutdatedTextureBinds());
+}
+
 std::string D3D12CommandProcessor::GpuProfLogTags() const {
   // Render target transfer census: mp_rtx.txt, once a second with the fps log.
   {
@@ -1729,6 +1737,10 @@ void D3D12CommandProcessor::ReplayThreadMain() {
     }
     if (job.list) {
       shared_memory_->WaitForUploads(job.upload_ticket);
+      std::unique_lock<std::mutex> record_lock(replay_record_mutex_, std::defer_lock);
+      if (GetD3D12Settings().async_replay_lock.Get()) {
+        record_lock.lock();
+      }
       job.allocator->Reset();
       command_list_->Reset(job.allocator, nullptr);
       job.list->Execute(command_list_, command_list_1_);
@@ -1736,6 +1748,9 @@ void D3D12CommandProcessor::ReplayThreadMain() {
       ID3D12CommandList* execute_command_lists[] = {command_list_};
       direct_queue->ExecuteCommandLists(1, execute_command_lists);
       direct_queue->Signal(submission_fence_, job.value);
+      if (record_lock.owns_lock()) {
+        record_lock.unlock();
+      }
       job.list->Reset();
     } else if (job.fence) {
       direct_queue->Signal(job.fence, job.value);
@@ -3688,6 +3703,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       job.value = submission_current_;
       job.upload_ticket = shared_memory_->UploadTicket();
       ReplayEnqueue(job);
+      if (GetD3D12Settings().async_replay_wait.Get()) {
+        FlushAsyncReplay();
+      }
     } else {
       shared_memory_->WaitForUploads(shared_memory_->UploadTicket());
       command_allocator->Reset();
