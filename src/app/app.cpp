@@ -132,6 +132,7 @@ struct App::State final : IAppInfo {
   bool init_done = false;
   bool headless = false;
   bool on_init_done = false;
+  bool ended_early = false;
   i32 final_code = 0;
   AppSysRequirements needs;
   IInterfaceFactory* private_host = nullptr;
@@ -408,6 +409,12 @@ Result<void> App::Init(const CLIArgList& args) {
     }
     State::DrainNotices(settings_control);
 
+    if (IsShutdownRequested()) {
+      // The error only unwinds rex::Init. Init reports success to the caller.
+      state.ended_early = true;
+      return Result<std::vector<std::string>>(
+          std::unexpected(Error(ErrorCategory::kRuntime, "startup ended by a shutdown request")));
+    }
     if (auto crash = platform::InstallCrashReporter(GetCrashOptions()); !crash) {
       return failed("crash reporter", crash.error());
     }
@@ -435,7 +442,13 @@ Result<void> App::Init(const CLIArgList& args) {
 
   detail::SetInitOwner(this);
   if (auto started = rex::Init(config); !started) {
+    ILogger* const logger = state.logger;
     state.ForgetSystems();
+    if (state.ended_early) {
+      // Shutdown flushes the log file through this pointer.
+      state.logger = logger;
+      return Ok();
+    }
     if (state.error_reported) {
       return started;
     }
