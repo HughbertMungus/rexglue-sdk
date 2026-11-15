@@ -328,7 +328,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(u32 used_texture_mask) {
   const auto& regs = GetRegisterFile();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+  // Checked with a plain load first: a locked exchange on every draw costs more than the rare
+  // reset (especially under x86-to-ARM translation).
+  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
+      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     ResetTextureBindings();
   }
 

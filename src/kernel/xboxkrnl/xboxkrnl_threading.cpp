@@ -22,6 +22,7 @@
 #include <rex/kernel/types/status.h>
 #include <rex/kernel/types/thread.h>
 #include <rex/kernel/xboxkrnl.h>
+#include <rex/kernel/kernel_settings.h>
 #include <rex/logging/log_category.h>
 #include "kernel/categories.h"
 #include <rex/ppc/hook.h>
@@ -358,9 +359,47 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, MappedU64 in
   return result;
 }
 
+namespace {
+// Idle polling loops (the title's job workers with no work, its render thread polling an event)
+// make millions of yields or zero-timeout waits a second, each a host call that keeps a core
+// busy. A thread polling back to back (each poll within kernel.yield_idle_gap_us of the last;
+// the title's idle job workers scan their queues for ~90 us between yields) sleeps briefly once
+// the streak reaches kernel.yield_idle_streak; any real work between polls resets it.
+struct IdlePollStreak {
+  u64 last_ns = 0;
+  u32 streak = 0;
+};
+u64 IdlePollNowNs() {
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count());
+}
+/** Counts a poll; sleeps sleep_us and returns true when the thread is polling back to back. */
+bool IdlePollBackoff(IdlePollStreak& state, u32 sleep_us, u32 streak_needed, u32 gap_us) {
+  u64 now_ns = IdlePollNowNs();
+  state.streak = (now_ns - state.last_ns < u64(gap_us) * 1000) ? state.streak + 1 : 0;
+  if (state.streak >= streak_needed) {
+    rex::platform::IdleSleep(std::chrono::microseconds(sleep_us));
+    state.last_ns = IdlePollNowNs();
+    return true;
+  }
+  state.last_ns = now_ns;
+  return false;
+}
+}  // namespace
+
 u32 NtYieldExecution_entry() {
   KernelThread::CheckStop();
   KernelThread::WriteKernelTime();
+  const KernelSettings& settings = GetCurrentState().GetKernelSettings();
+  const u32 idle_sleep_us = settings.yield_idle_sleep_us.Get();
+  if (idle_sleep_us) {
+    thread_local IdlePollStreak yield_streak;
+    if (IdlePollBackoff(yield_streak, idle_sleep_us, settings.yield_idle_streak.Get(),
+                        settings.yield_idle_gap_us.Get())) {
+      return X_STATUS_SUCCESS;
+    }
+  }
   rex::platform::MaybeYield();
   return X_STATUS_SUCCESS;
 }
@@ -936,6 +975,17 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
       Wait(kernel::GetCurrent(), object, 3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
   if (alertable && result == X_STATUS_USER_APC) {
     KernelThread::GetCallingThread()->DeliverAPCs();
+  }
+  if (timeout_ptr && !timeout && result == X_STATUS_TIMEOUT) {
+    // A poll that found the object unsignaled (the title's render thread polls an event this
+    // way hundreds of thousands of times a second).
+    const KernelSettings& settings = GetCurrentState().GetKernelSettings();
+    const u32 poll_sleep_us = settings.wait_poll_sleep_us.Get();
+    if (poll_sleep_us) {
+      thread_local IdlePollStreak wait_poll_streak;
+      IdlePollBackoff(wait_poll_streak, poll_sleep_us, settings.yield_idle_streak.Get(),
+                      settings.yield_idle_gap_us.Get());
+    }
   }
 
   return result;
@@ -1629,7 +1679,17 @@ REX_EXPORT(__imp__KeSetAffinityThread, rex::kernel::xboxkrnl::KeSetAffinityThrea
 REX_EXPORT(__imp__KeQueryBasePriorityThread, rex::kernel::xboxkrnl::KeQueryBasePriorityThread_entry)
 REX_EXPORT(__imp__KeSetBasePriorityThread, rex::kernel::xboxkrnl::KeSetBasePriorityThread_entry)
 REX_EXPORT(__imp__KeSetDisableBoostThread, rex::kernel::xboxkrnl::KeSetDisableBoostThread_entry)
-REX_EXPORT(__imp__KeGetCurrentProcessType, rex::kernel::xboxkrnl::KeGetCurrentProcessType_entry)
+// The title calls this often (up to millions of times a second in its job workers): read the PCR through r13 of
+// the calling context instead of looking up the calling thread object.
+REX_HOOK_RAW(__imp__KeGetCurrentProcessType) {
+  auto pcr = rex::memory::GuestPtr<rex::kernel::X_KPCR*>(base, static_cast<u32>(ctx.r13.u64));
+  if (pcr->prcb_data.dpc_active) {
+    ctx.r3.u64 = pcr->processtype_value_in_dpc;
+    return;
+  }
+  auto thread = rex::memory::GuestPtr<rex::kernel::X_KTHREAD*>(base, pcr->prcb_data.current_thread);
+  ctx.r3.u64 = thread->process_type;
+}
 REX_EXPORT(__imp__KeSetCurrentProcessType, rex::kernel::xboxkrnl::KeSetCurrentProcessType_entry)
 REX_EXPORT(__imp__KeQueryPerformanceFrequency,
            rex::kernel::xboxkrnl::KeQueryPerformanceFrequency_entry)

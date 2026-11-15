@@ -826,6 +826,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_samplers_pixel_;
 
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+  // The index buffer view last set in the current command list (identical ones are skipped:
+  // ~31% of index buffer binds in BO2 repeat the previous one).
+  D3D12_INDEX_BUFFER_VIEW current_index_buffer_view_ = {};
+  bool current_index_buffer_view_valid_ = false;
 
   std::vector<draw_state::MemExportRange> memexport_ranges_;
 };

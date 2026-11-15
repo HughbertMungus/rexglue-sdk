@@ -261,6 +261,14 @@ void SyncMemory() {
   __sync_synchronize();
 }
 
+void IdleSleep(std::chrono::microseconds duration) {
+  if (duration <= std::chrono::microseconds::zero()) {
+    MaybeYield();
+    return;
+  }
+  SleepFor(duration);
+}
+
 void SleepFor(std::chrono::microseconds duration) {
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};

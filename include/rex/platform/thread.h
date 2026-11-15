@@ -80,6 +80,12 @@ REX_API void MaybeYield();
 /** Issues a full memory barrier. */
 REX_API void SyncMemory();
 
+/**
+ * Sleeps the calling thread for about the duration without spinning: it may wake late, by up
+ * to the host timer resolution, but uses no CPU while waiting (idle polling loops).
+ */
+REX_API void IdleSleep(std::chrono::microseconds duration);
+
 /** Sleeps the calling thread for at least the duration. A duration of 0 yields. */
 REX_API void SleepFor(std::chrono::microseconds duration);
 

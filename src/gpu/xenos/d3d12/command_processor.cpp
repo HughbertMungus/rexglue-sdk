@@ -133,11 +133,15 @@ inline u64 DrawCycleStamp() {
   return 0;
 #endif
 }
+// Only the command thread writes the totals, so plain loads and stores (no locked read-modify-
+// writes, costly under x86-to-ARM translation); the log reads differences between snapshots.
 struct DrawCycleScope {
   u64 start = DrawCycleStamp();
   ~DrawCycleScope() {
-    g_draw_cycles.fetch_add(DrawCycleStamp() - start, std::memory_order_relaxed);
-    g_draw_count.fetch_add(1, std::memory_order_relaxed);
+    g_draw_cycles.store(g_draw_cycles.load(std::memory_order_relaxed) + (DrawCycleStamp() - start),
+                        std::memory_order_relaxed);
+    g_draw_count.store(g_draw_count.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_relaxed);
   }
 };
 }  // namespace
@@ -146,8 +150,13 @@ std::string D3D12CommandProcessor::TextureBindDiagnosticTags() const {
   if (!texture_cache_) {
     return {};
   }
-  u64 draw_cycles = g_draw_cycles.exchange(0, std::memory_order_relaxed);
-  u64 draw_count = g_draw_count.exchange(0, std::memory_order_relaxed);
+  static u64 last_draw_cycles = 0, last_draw_count = 0;
+  u64 total_cycles = g_draw_cycles.load(std::memory_order_relaxed);
+  u64 total_count = g_draw_count.load(std::memory_order_relaxed);
+  u64 draw_cycles = total_cycles - last_draw_cycles;
+  u64 draw_count = total_count - last_draw_count;
+  last_draw_cycles = total_cycles;
+  last_draw_count = total_count;
   return " dcy=" + std::to_string(draw_count ? draw_cycles / draw_count : 0) +
          " dps=" + std::to_string(draw_count) +
          " tnl=" + std::to_string(texture_cache_->GetUnloadedTextureBinds()) +
@@ -3133,7 +3142,14 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
         REX_UNHANDLED_CASE(primitive_processing_result.index_buffer_type);
         return false;
     }
-    deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
+    if (!current_index_buffer_view_valid_ ||
+        current_index_buffer_view_.BufferLocation != index_buffer_view.BufferLocation ||
+        current_index_buffer_view_.SizeInBytes != index_buffer_view.SizeInBytes ||
+        current_index_buffer_view_.Format != index_buffer_view.Format) {
+      deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
+      current_index_buffer_view_ = index_buffer_view;
+      current_index_buffer_view_valid_ = true;
+    }
     if (memexport_used) {
       shared_memory_->UseForWriting();
     } else {
@@ -3763,6 +3779,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       sampler_bindful_heap_current_ = nullptr;
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    current_index_buffer_view_valid_ = false;
 
     render_target_cache_->BeginSubmission();
 

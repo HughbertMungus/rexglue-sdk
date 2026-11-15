@@ -741,7 +741,9 @@ void D3D12TextureCache::CheckBoundTextureLoaded(const Texture& texture,
   const TextureKey& key = texture.GetKey();
   if (key.base_page != 0 &&
       static_cast<const D3D12Texture&>(texture).GetBaseLoadGeneration() == 0) {
-    unloaded_texture_binds_.fetch_add(1, std::memory_order_relaxed);
+    // Command thread only: plain store, no locked add.
+    unloaded_texture_binds_.store(unloaded_texture_binds_.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
     if (unloaded_texture_binds_logged_ < 32) {
       ++unloaded_texture_binds_logged_;
       REXGPU_WARN(
@@ -752,7 +754,8 @@ void D3D12TextureCache::CheckBoundTextureLoaded(const Texture& texture,
           key.base_page << 12, key.mip_page << 12, texture.GetOutdatedMask());
     }
   } else if (texture.GetOutdatedMask() != 0) {
-    outdated_texture_binds_.fetch_add(1, std::memory_order_relaxed);
+    outdated_texture_binds_.store(outdated_texture_binds_.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
   }
 }
 

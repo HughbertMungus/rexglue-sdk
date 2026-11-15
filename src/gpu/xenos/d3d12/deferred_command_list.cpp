@@ -9,6 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <vector>
+
 #include <rex/assert.h>
 #include <rex/platform/perf.h>
 #include "gpu/xenos/d3d12/command_processor.h"
@@ -16,6 +23,108 @@
 #include <rex/math.h>
 
 namespace rex::gpu::d3d12 {
+
+namespace {
+// gpu.d3d12.command_census: commands replayed by type, and those identical to the previous command
+// of the same type (root arguments: the previous one for the same root parameter, until the root
+// signature or descriptor heaps change). Replay runs on one thread at a time.
+struct CommandCensus {
+  static constexpr u32 kTypes = 64;
+  u64 count[kTypes] = {};
+  u64 repeated[kTypes] = {};
+  u64 bytes[kTypes] = {};
+  std::vector<uintmax_t> last[kTypes];
+  bool last_valid[kTypes] = {};
+  u64 last_root[2][3][64] = {};  // [compute, graphics][table, cbv, constants hash][index]
+  bool last_root_valid[2][3][64] = {};
+  std::chrono::steady_clock::time_point next_report = std::chrono::steady_clock::now();
+  u64 executes = 0;
+};
+CommandCensus g_command_census;
+
+const char* CommandName(u32 command) {
+  static const char* const kNames[] = {
+      "ClearDepthStencilView", "ClearRenderTargetView", "ClearUAVUint", "CopyBufferRegion",
+      "CopyResource", "CopyTexture", "CopyTextureRegion", "Dispatch", "DrawIndexedInstanced",
+      "DrawInstanced", "BeginQuery", "EndQuery", "ResolveQueryData", "IASetIndexBuffer",
+      "IASetPrimitiveTopology", "IASetVertexBuffers", "OMSetBlendFactor", "OMSetRenderTargets",
+      "OMSetStencilRef", "ResourceBarrier", "RSSetScissorRect", "RSSetViewport",
+      "SetComputeRoot32BitConstants", "SetGraphicsRoot32BitConstants", "SetComputeRootCBV",
+      "SetGraphicsRootCBV", "SetComputeRootDescriptorTable", "SetGraphicsRootDescriptorTable",
+      "SetComputeRootSRV", "SetGraphicsRootSRV", "SetComputeRootSignature",
+      "SetGraphicsRootSignature", "SetComputeRootUAV", "SetGraphicsRootUAV", "SetDescriptorHeaps",
+      "SetPipelineState", "SetPipelineStateHandle", "SetSamplePositions", "BeginDebugMarker",
+      "EndDebugMarker", "InsertDebugMarker"};
+  return command < std::size(kNames) ? kNames[command] : "?";
+}
+
+void CommandCensusReset(CommandCensus& c) {
+  std::fill(std::begin(c.last_valid), std::end(c.last_valid), false);
+  std::memset(c.last_root_valid, 0, sizeof(c.last_root_valid));
+}
+
+void CommandCensusRecord(CommandCensus& c, u32 command, const uintmax_t* args,
+                         size_t args_elements, bool is_root, bool compute, u32 root_kind,
+                         u32 root_index, u64 root_value) {
+  if (command >= CommandCensus::kTypes) {
+    return;
+  }
+  ++c.count[command];
+  c.bytes[command] += args_elements * sizeof(uintmax_t);
+  bool repeated;
+  if (is_root) {
+    u32 i = root_index & 63;
+    repeated = c.last_root_valid[compute][root_kind][i] &&
+               c.last_root[compute][root_kind][i] == root_value;
+    c.last_root[compute][root_kind][i] = root_value;
+    c.last_root_valid[compute][root_kind][i] = true;
+  } else {
+    std::vector<uintmax_t>& last = c.last[command];
+    repeated = c.last_valid[command] && last.size() == args_elements &&
+               std::equal(last.begin(), last.end(), args);
+    last.assign(args, args + args_elements);
+    c.last_valid[command] = true;
+  }
+  if (repeated) {
+    ++c.repeated[command];
+  }
+}
+
+void CommandCensusMaybeReport(CommandCensus& c) {
+  auto now = std::chrono::steady_clock::now();
+  if (now < c.next_report) {
+    return;
+  }
+  c.next_report = now + std::chrono::seconds(10);
+  u64 draws = c.count[static_cast<u32>(8)] + c.count[static_cast<u32>(9)];
+  std::FILE* out = nullptr;
+  if (draws && fopen_s(&out, "mp_cmdcensus.txt", "a") == 0 && out) {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_local;
+    localtime_s(&tm_local, &t);
+    u64 total = 0;
+    for (u64 n : c.count) total += n;
+    std::fprintf(out, "%02d:%02d:%02d draws=%llu executes=%llu commands/draw=%.2f\n",
+                 tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
+                 static_cast<unsigned long long>(draws),
+                 static_cast<unsigned long long>(c.executes), double(total) / draws);
+    std::vector<std::pair<u64, u32>> order;
+    for (u32 i = 0; i < CommandCensus::kTypes; ++i) {
+      if (c.count[i]) order.emplace_back(c.count[i], i);
+    }
+    std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    for (auto& [n, i] : order) {
+      std::fprintf(out, "  %-30s %8.3f/draw  repeated %5.1f%%  %6.1f B avg\n", CommandName(i),
+                   double(n) / draws, 100.0 * c.repeated[i] / n, double(c.bytes[i]) / n);
+    }
+    std::fclose(out);
+  }
+  std::memset(c.count, 0, sizeof(c.count));
+  std::memset(c.repeated, 0, sizeof(c.repeated));
+  std::memset(c.bytes, 0, sizeof(c.bytes));
+  c.executes = 0;
+}
+}  // namespace
 
 DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_processor,
                                          size_t initial_size_bytes)
@@ -35,10 +144,57 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
   const uintmax_t* stream = command_stream_.Data();
   size_t stream_remaining = command_stream_.Size();
   ID3D12PipelineState* current_pipeline_state = nullptr;
+  const bool census = command_processor_.GetD3D12Settings().command_census.Get();
+  if (census) {
+    CommandCensusReset(g_command_census);
+    ++g_command_census.executes;
+  }
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+    if (census) {
+      bool is_root = false, compute = false;
+      u32 root_kind = 0, root_index = 0;
+      u64 root_value = 0;
+      switch (header.command) {
+        case Command::kD3DSetComputeRootDescriptorTable:
+        case Command::kD3DSetGraphicsRootDescriptorTable: {
+          auto& a = *reinterpret_cast<const SetRootDescriptorTableArguments*>(stream);
+          is_root = true;
+          compute = header.command == Command::kD3DSetComputeRootDescriptorTable;
+          root_kind = 0;
+          root_index = a.root_parameter_index;
+          root_value = a.base_descriptor.ptr;
+        } break;
+        case Command::kD3DSetComputeRootConstantBufferView:
+        case Command::kD3DSetGraphicsRootConstantBufferView:
+        case Command::kD3DSetComputeRootShaderResourceView:
+        case Command::kD3DSetGraphicsRootShaderResourceView:
+        case Command::kD3DSetComputeRootUnorderedAccessView:
+        case Command::kD3DSetGraphicsRootUnorderedAccessView: {
+          auto& a = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+          is_root = true;
+          compute = header.command == Command::kD3DSetComputeRootConstantBufferView ||
+                    header.command == Command::kD3DSetComputeRootShaderResourceView ||
+                    header.command == Command::kD3DSetComputeRootUnorderedAccessView;
+          root_kind = 1;
+          root_index = a.root_parameter_index;
+          root_value = a.buffer_location;
+        } break;
+        case Command::kD3DSetComputeRootSignature:
+        case Command::kD3DSetGraphicsRootSignature:
+        case Command::kSetDescriptorHeaps:
+          std::memset(g_command_census.last_root_valid, 0,
+                      sizeof(g_command_census.last_root_valid));
+          break;
+        default:
+          break;
+      }
+      CommandCensusRecord(g_command_census, static_cast<u32>(header.command), stream,
+                          header.arguments_size_elements, is_root, compute, root_kind,
+                          root_index, root_value);
+    }
     switch (header.command) {
       case Command::kD3DClearDepthStencilView: {
         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
@@ -273,6 +429,9 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     }
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
+  }
+  if (census) {
+    CommandCensusMaybeReport(g_command_census);
   }
 }
 

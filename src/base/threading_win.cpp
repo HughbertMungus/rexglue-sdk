@@ -143,6 +143,16 @@ TimerWait WaitOnSleepTimer(std::chrono::microseconds duration, bool alertable) {
 
 }  // namespace
 
+void IdleSleep(std::chrono::microseconds duration) {
+  if (duration <= std::chrono::microseconds::zero()) {
+    MaybeYield();
+    return;
+  }
+  if (WaitOnSleepTimer(duration, false) != TimerWait::kElapsed) {
+    ::Sleep(1);
+  }
+}
+
 void SleepFor(std::chrono::microseconds duration) {
   if (duration <= std::chrono::microseconds::zero()) {
     MaybeYield();

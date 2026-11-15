@@ -86,6 +86,9 @@ class D3D12Settings : public SettingOwner {
   REX_SETTING(bool, texture_load_census, false,
               "Count texture data loads by texture (loads and bytes), the top ones every 10 seconds "
               "in mp_texload.txt in the working folder");
+  REX_SETTING(bool, command_census, false,
+              "Count replayed D3D12 commands by type and how many repeat the previous identical "
+              "command (per root parameter for root arguments), every 10 s in mp_cmdcensus.txt");
   REX_SETTING(bool, rt_transfer_census, false,
               "Count render target ownership transfers by kind and by source -> destination render "
               "target, one line a second in mp_rtx.txt (needs REX_FPS_LOG=1)");

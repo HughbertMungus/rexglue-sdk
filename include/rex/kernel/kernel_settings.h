@@ -31,6 +31,21 @@ class REX_KERNEL_API KernelSettings final : public SettingOwner {
               "for local split screen",
               Range{1, 4}, kUntilLaunch);
 
+  REX_SETTING(u32, yield_idle_sleep_us, 0,
+              "When a guest thread keeps yielding back to back (an idle polling loop such as a "
+              "job worker with no work), sleep it this long on a timer instead of yielding, so "
+              "it stops spinning a core. 0 always yields");
+  REX_SETTING(u32, yield_idle_streak, 32,
+              "Back-to-back yields (each within yield_idle_gap_us of the last) before "
+              "yield_idle_sleep_us applies");
+  REX_SETTING(u32, yield_idle_gap_us, 50,
+              "Longest time between two polls (yields, or zero-timeout waits that time out) that "
+              "still counts them as back to back");
+  REX_SETTING(u32, wait_poll_sleep_us, 0,
+              "When a guest thread keeps polling an object with zero-timeout waits that time out "
+              "(back to back, as yield_idle_streak counts them), sleep it this long before "
+              "returning the timeout. 0 never sleeps");
+
   KernelSettings();
 };
 
