@@ -11,6 +11,7 @@
 
 #include "thirdparty/dxbc/DXBCChecksum.h"
 
+#include <rex/platform/perf.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -945,6 +946,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
     }
   }
   gpu::d3d12::objects::ReleaseAndNull(uint32_rtv_clear_root_signature_);
+  for (ID3D12PipelineState*& pipeline : resolve_to_texture_pipelines_) {
+    gpu::d3d12::objects::ReleaseAndNull(pipeline);
+  }
+  gpu::d3d12::objects::ReleaseAndNull(resolve_to_texture_root_signature_);
 
   for (const auto& dump_pipeline_pair : dump_pipelines_) {
     if (dump_pipeline_pair.second) {
@@ -1033,16 +1038,31 @@ void D3D12RenderTargetCache::BeginSubmission() {
 bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
                                     xenos::reg::RB_DEPTHCONTROL normalized_depth_control,
                                     u32 normalized_color_mask, const Shader& vertex_shader) {
-  if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
-    return false;
+  {
+#ifdef REXGLUE_ENABLE_PROFILING
+    ZoneNamedN(rexgpu_rt_base, "rt_base_update", TracyIsStarted);
+#endif
+    if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
+                                   normalized_color_mask, vertex_shader)) {
+      return false;
+    }
   }
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets = GetLastUpdateAccumulatedRenderTargets();
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, GetLastUpdateTransfers());
-      SetCommandListRenderTargets(depth_and_color_render_targets);
+      {
+#ifdef REXGLUE_ENABLE_PROFILING
+        ZoneNamedN(rexgpu_rt_transfers, "rt_transfers", TracyIsStarted);
+#endif
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, GetLastUpdateTransfers());
+      }
+      {
+#ifdef REXGLUE_ENABLE_PROFILING
+        ZoneNamedN(rexgpu_rt_set, "rt_set_targets", TracyIsStarted);
+#endif
+        SetCommandListRenderTargets(depth_and_color_render_targets);
+      }
       // Write versions (gpu.d3d12.rt_transfer_memo): the draw writes every bound colour target
       // (bound only with a non-zero write mask) and the depth target only with depth writes or
       // stencil operations that can change the buffer.
@@ -1186,6 +1206,366 @@ void D3D12RenderTargetCache::WriteEDRAMUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
+bool D3D12RenderTargetCache::InitializeResolveToTexture() {
+  if (resolve_to_texture_pipelines_[0]) {
+    return true;
+  }
+  if (resolve_to_texture_init_failed_) {
+    return false;
+  }
+  resolve_to_texture_init_failed_ = true;
+  // Blit pixel shaders, compiled at runtime (prototype; the SDK's own shaders are prebuilt).
+  // Color: copies the render target texel, optionally with red and blue swapped.
+  static const char kColorSource[] =
+      "Texture2D<float4> xe_source : register(t0);\n"
+      "cbuffer XeConstants : register(b0) { int2 xe_offset; uint xe_swap_rb; uint xe_flags; };\n"
+      "float4 main(float4 xe_position : SV_Position) : SV_Target {\n"
+      "  float4 v = xe_source.Load(int3(int2(xe_position.xy) + xe_offset, 0));\n"
+      "  return xe_swap_rb ? v.bgra : v;\n"
+      "}\n";
+  // Depth (host D32_FLOAT_S8X24 holding guest 20e4 depth / 2): the guest word the resolve writes
+  // is (Float32To20e4(depth * 2) << 8) | stencil. xe_flags bit 0: round to nearest even (else
+  // truncate, as depth_float24_round); bit 1: output that word's bytes as RGBA8 (a k_8_8_8_8
+  // texture of the same memory) instead of the k_24_8_FLOAT texture's decoded float.
+  static const char kDepthSource[] =
+      "Texture2D<float4> xe_depth : register(t0);\n"
+      "Texture2D<uint2> xe_stencil : register(t1);\n"
+      "cbuffer XeConstants : register(b0) { int2 xe_offset; uint xe_swap_rb; uint xe_flags; };\n"
+      "uint XeFloat32To20e4(float value, bool round_to_nearest_even) {\n"
+      "  if (!(value > 0.0f)) return 0u;\n"
+      "  uint f = asuint(value);\n"
+      "  if (f >= 0x3FFFFFF8u) return 0xFFFFFFu;\n"
+      "  if (f < 0x38800000u) {\n"
+      "    uint shift = min(113u - (f >> 23), 24u);\n"
+      "    f = (0x800000u | (f & 0x7FFFFFu)) >> shift;\n"
+      "  } else {\n"
+      "    f += 0xC8000000u;\n"
+      "  }\n"
+      "  if (round_to_nearest_even) f += 3u + ((f >> 3) & 1u);\n"
+      "  return (f >> 3) & 0xFFFFFFu;\n"
+      "}\n"
+      "float XeFloat20e4To32(uint f24) {\n"
+      "  f24 &= 0xFFFFFFu;\n"
+      "  if (!f24) return 0.0f;\n"
+      "  uint mantissa = f24 & 0xFFFFFu;\n"
+      "  uint exponent = f24 >> 20;\n"
+      "  if (!exponent) {\n"
+      "    uint lz = 31u - firstbithigh(mantissa) - (32u - 21u);\n"
+      "    exponent = uint(1 - int(lz));\n"
+      "    mantissa = (mantissa << lz) & 0xFFFFFu;\n"
+      "  }\n"
+      "  return asfloat(((exponent + 112u) << 23) | (mantissa << 3));\n"
+      "}\n"
+      "float4 main(float4 xe_position : SV_Position) : SV_Target {\n"
+      "  int3 p = int3(int2(xe_position.xy) + xe_offset, 0);\n"
+      "  uint f24 = XeFloat32To20e4(xe_depth.Load(p).r * 2.0f, (xe_flags & 1u) != 0u);\n"
+      "  if (xe_flags & 2u) {\n"
+      "    uint word = (f24 << 8) | (xe_stencil.Load(p).g & 0xFFu);\n"
+      "    return float4(word & 0xFFu, (word >> 8) & 0xFFu, (word >> 16) & 0xFFu, word >> 24) /\n"
+      "           255.0f;\n"
+      "  }\n"
+      "  return float4(XeFloat20e4To32(f24), 0.0f, 0.0f, 0.0f);\n"
+      "}\n";
+  HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+  if (!compiler) {
+    REXGPU_ERROR("resolve_to_texture: d3dcompiler_47.dll is not available");
+    return false;
+  }
+  using D3DCompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR,
+                                        LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+  auto d3d_compile = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
+  if (!d3d_compile) {
+    REXGPU_ERROR("resolve_to_texture: D3DCompile is not available");
+    return false;
+  }
+  Microsoft::WRL::ComPtr<ID3DBlob> color_ps, depth_ps, error_blob;
+  if (FAILED(d3d_compile(kColorSource, sizeof(kColorSource) - 1, "resolve_to_texture_color",
+                         nullptr, nullptr, "main", "ps_5_0", 0, 0, &color_ps, &error_blob)) ||
+      FAILED(d3d_compile(kDepthSource, sizeof(kDepthSource) - 1, "resolve_to_texture_depth",
+                         nullptr, nullptr, "main", "ps_5_0", 0, 0, &depth_ps, &error_blob))) {
+    REXGPU_ERROR("resolve_to_texture: pixel shader compilation failed: {}",
+                 error_blob ? static_cast<const char*>(error_blob->GetBufferPointer()) : "?");
+    return false;
+  }
+
+  const gpu::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  D3D12_DESCRIPTOR_RANGE ranges[2];
+  for (u32 i = 0; i < 2; ++i) {
+    ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[i].NumDescriptors = 1;
+    ranges[i].BaseShaderRegister = i;
+    ranges[i].RegisterSpace = 0;
+    ranges[i].OffsetInDescriptorsFromTableStart = 0;
+  }
+  D3D12_ROOT_PARAMETER parameters[3];
+  for (u32 i = 0; i < 2; ++i) {
+    parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[i].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+    parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  }
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[2].Constants.ShaderRegister = 0;
+  parameters[2].Constants.RegisterSpace = 0;
+  parameters[2].Constants.Num32BitValues = 4;
+  parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc;
+  root_desc.NumParameters = 3;
+  root_desc.pParameters = parameters;
+  root_desc.NumStaticSamplers = 0;
+  root_desc.pStaticSamplers = nullptr;
+  root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  resolve_to_texture_root_signature_ = gpu::d3d12::objects::CreateRootSignature(provider, root_desc);
+  if (!resolve_to_texture_root_signature_) {
+    REXGPU_ERROR("resolve_to_texture: failed to create the root signature");
+    return false;
+  }
+  auto pipeline_desc = objects::BuildGraphicsPipelineStateDesc();
+  pipeline_desc.pRootSignature = resolve_to_texture_root_signature_;
+  pipeline_desc.VS.pShaderBytecode = shaders::kFullscreenCWVS;
+  pipeline_desc.VS.BytecodeLength = sizeof(shaders::kFullscreenCWVS);
+  pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.RasterizerState.DepthClipEnable = TRUE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.SampleDesc.Count = 1;
+  // [0] color R8G8B8A8, [1] color R10G10B10A2, [2] depth to R32_FLOAT, [3] depth to R8G8B8A8.
+  struct PipelineSpec {
+    ID3DBlob* ps;
+    DXGI_FORMAT format;
+  };
+  const PipelineSpec specs[4] = {{color_ps.Get(), DXGI_FORMAT_R8G8B8A8_UNORM},
+                                 {color_ps.Get(), DXGI_FORMAT_R10G10B10A2_UNORM},
+                                 {depth_ps.Get(), DXGI_FORMAT_R32_FLOAT},
+                                 {depth_ps.Get(), DXGI_FORMAT_R8G8B8A8_UNORM}};
+  for (size_t i = 0; i < 4; ++i) {
+    pipeline_desc.PS.pShaderBytecode = specs[i].ps->GetBufferPointer();
+    pipeline_desc.PS.BytecodeLength = specs[i].ps->GetBufferSize();
+    pipeline_desc.RTVFormats[0] = specs[i].format;
+    if (FAILED(provider.GetDevice()->CreateGraphicsPipelineState(
+            &pipeline_desc, IID_PPV_ARGS(&resolve_to_texture_pipelines_[i])))) {
+      REXGPU_ERROR("resolve_to_texture: failed to create pipeline {}", i);
+      return false;
+    }
+  }
+  resolve_to_texture_init_failed_ = false;
+  REXGPU_INFO("resolve_to_texture: blit pipelines ready");
+  return true;
+}
+
+void D3D12RenderTargetCache::ResolveToTextureBlit(D3D12RenderTarget& render_target,
+                                                  D3D12TextureCache& texture_cache,
+                                                  const D3D12TextureCache::ResolveToTextureTarget&
+                                                      target,
+                                                  u32 pipeline_index, u32 source_x, u32 source_y,
+                                                  bool swap_rb, u32 flags) {
+  static constexpr DXGI_FORMAT kPipelineFormats[4] = {
+      DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R32_FLOAT,
+      DXGI_FORMAT_R8G8B8A8_UNORM};
+  if (pipeline_index >= 4 || target.rtv_format != kPipelineFormats[pipeline_index]) {
+    return;  // The texture stays outdated and is reloaded normally.
+  }
+  gpu::d3d12::objects::DescriptorCPUGPUHandlePair descriptors[2];
+  const bool depth = render_target.GetKey().is_depth;
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(depth ? 2 : 1, descriptors)) {
+    return;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  device->CopyDescriptorsSimple(1, descriptors[0].first,
+                                render_target.GetDescriptorSRV().GetHandle(),
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  if (depth) {
+    device->CopyDescriptorsSimple(1, descriptors[1].first,
+                                  render_target.GetDescriptorSRVStencil().GetHandle(),
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  } else {
+    descriptors[1] = descriptors[0];
+  }
+  constexpr D3D12_RESOURCE_STATES kSourceState =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  command_processor_.PushTransitionBarrier(render_target.GetResource(),
+                                           render_target.SetResourceState(kSourceState),
+                                           kSourceState);
+  command_processor_.SubmitBarriers();
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  command_list.D3DOMSetRenderTargets(1, &target.rtv, FALSE, nullptr);
+  are_current_command_list_render_targets_valid_ = false;
+  D3D12_VIEWPORT viewport;
+  viewport.TopLeftX = 0.0f;
+  viewport.TopLeftY = 0.0f;
+  viewport.Width = static_cast<f32>(target.width);
+  viewport.Height = static_cast<f32>(target.height);
+  viewport.MinDepth = 0.0f;
+  viewport.MaxDepth = 1.0f;
+  command_processor_.SetViewport(viewport);
+  D3D12_RECT scissor = {0, 0, static_cast<LONG>(target.width), static_cast<LONG>(target.height)};
+  command_processor_.SetScissorRect(scissor);
+  command_processor_.SetExternalGraphicsRootSignature(resolve_to_texture_root_signature_);
+  command_processor_.SetExternalPipeline(resolve_to_texture_pipelines_[pipeline_index]);
+  command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  command_list.D3DSetGraphicsRootDescriptorTable(0, descriptors[0].second);
+  command_list.D3DSetGraphicsRootDescriptorTable(1, descriptors[1].second);
+  u32 constants[4] = {source_x, source_y, swap_rb ? 1u : 0u, flags};
+  command_list.D3DSetGraphicsRoot32BitConstants(2, 4, constants, 0);
+  command_list.D3DDrawInstanced(3, 1, 0, 0);
+  texture_cache.FinishResolveToTexture(target);
+}
+
+void D3D12RenderTargetCache::TryResolveToTexture(const draw_state::ResolveRequest& resolve_info,
+                                                 D3D12TextureCache& texture_cache) {
+  // Case A: 1x k_8_8_8_8 color to a k_8_8_8_8 texture. Case B: 1x k_2_10_10_10 (or the 10 bit
+  // blending variant, the same host format) to a k_2_10_10_10 texture. Case C: 1x kD24FS8 depth
+  // to k_24_8_FLOAT, written to the k_24_8_FLOAT and k_8_8_8_8 textures of that memory.
+  const bool depth = resolve_info.IsCopyingDepth();
+  const draw_state::ResolveEDRAMLayout& source =
+      depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  const xenos::reg::RB_COPY_DEST_INFO& dest = resolve_info.copy_dest_info;
+  if (source.format_is_64bpp || source.msaa_samples != xenos::MSAASamples::k1X ||
+      dest.copy_dest_exp_bias != 0 || dest.copy_dest_array ||
+      resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8) {
+    return;
+  }
+  struct Output {
+    xenos::TextureFormat texture_format;
+    u32 pipeline_index;
+    u32 flags;
+  };
+  Output outputs[2];
+  u32 output_count = 0;
+  if (depth) {
+    if (static_cast<xenos::DepthRenderTargetFormat>(source.format) !=
+            xenos::DepthRenderTargetFormat::kD24FS8 ||
+        static_cast<u32>(dest.copy_dest_format) != 23 /* k_24_8_FLOAT */) {
+      return;
+    }
+    const u32 round = depth_float24_round_ ? 1u : 0u;
+    outputs[output_count++] = {xenos::TextureFormat::k_24_8_FLOAT, 2, round};
+    outputs[output_count++] = {xenos::TextureFormat::k_8_8_8_8, 3, round | 2u};
+  } else {
+    if (dest.copy_dest_number != xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction) {
+      return;
+    }
+    const auto source_format = static_cast<xenos::ColorRenderTargetFormat>(source.format);
+    if (source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+        dest.copy_dest_format == xenos::ColorFormat::k_8_8_8_8) {
+      outputs[output_count++] = {xenos::TextureFormat::k_8_8_8_8, 0, 0};
+    } else if ((source_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+                source_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) &&
+               dest.copy_dest_format == xenos::ColorFormat::k_2_10_10_10) {
+      outputs[output_count++] = {xenos::TextureFormat::k_2_10_10_10, 1, 0};
+    } else {
+      return;
+    }
+  }
+  // The single host render target that owns the whole source (DumpRenderTargets ran before).
+  if (dump_rectangles_.size() != 1 || !dump_rectangles_[0].render_target) {
+    return;
+  }
+  auto& render_target = *static_cast<D3D12RenderTarget*>(dump_rectangles_[0].render_target);
+  RenderTargetKey rt_key = render_target.GetKey();
+  if (rt_key.is_depth != depth || rt_key.msaa_samples != xenos::MSAASamples::k1X ||
+      rt_key.pitch_tiles_at_32bpp != source.pitch_tiles || source.base_tiles < rt_key.base_tiles) {
+    return;
+  }
+  if (depth ? rt_key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24FS8
+            : GetColorResourceDXGIFormat(rt_key.GetColorFormat()) !=
+                  GetColorResourceDXGIFormat(
+                      static_cast<xenos::ColorRenderTargetFormat>(source.format))) {
+    return;
+  }
+  const u32 tile_offset = source.base_tiles - rt_key.base_tiles;
+  const u32 source_x = (tile_offset % source.pitch_tiles) * xenos::kEDRAMTileWidthSamples +
+                       resolve_info.coordinate_info.edram_offset_x_div_8 * 8;
+  const u32 source_y = (tile_offset / source.pitch_tiles) * xenos::kEDRAMTileHeightSamples +
+                       resolve_info.coordinate_info.edram_offset_y_div_8 * 8;
+  const u32 width = resolve_info.coordinate_info.width_div_8 * 8;
+  const u32 height = resolve_info.height_div_8 * 8;
+  D3D12_RESOURCE_DESC rt_desc = render_target.GetResource()->GetDesc();
+  if (source_x + width > rt_desc.Width || source_y + height > rt_desc.Height) {
+    return;
+  }
+  const bool swap_rb =
+      (dest.copy_dest_swap != 0) !=
+      command_processor_.GetD3D12Settings().resolve_to_texture_invert_swap.Get();
+  for (u32 i = 0; i < output_count; ++i) {
+    D3D12TextureCache::ResolveToTextureTarget target;
+    if (!texture_cache.PrepareResolveToTexture(
+            resolve_info.copy_dest_base, width, height,
+            resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32, dest.copy_dest_endian,
+            outputs[i].texture_format, target)) {
+      continue;
+    }
+    if (!InitializeResolveToTexture()) {
+      return;
+    }
+    ResolveToTextureBlit(render_target, texture_cache, target, outputs[i].pipeline_index,
+                         source_x, source_y, !depth && swap_rb, outputs[i].flags);
+  }
+}
+
+void D3D12RenderTargetCache::ResolveCensusRecord(const draw_state::ResolveRequest& resolve_info) {
+  // Command thread only. One entry per distinct resolve (destination, format, source, size).
+  struct Entry {
+    u64 count = 0;
+    std::string text;
+  };
+  static std::unordered_map<std::string, Entry> entries;
+  static u64 total = 0;
+  static std::time_t window_start = std::time(nullptr);
+  const bool depth = resolve_info.IsCopyingDepth();
+  const draw_state::ResolveEDRAMLayout& src =
+      depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  const xenos::reg::RB_COPY_DEST_INFO& dest = resolve_info.copy_dest_info;
+  static const char* kMsaa[] = {"1x", "2x", "4x", "?"};
+  std::string text = std::format(
+      "dest 0x{:08X} {}x{} | src {} fmt {} {} pitch {}t base {}t | dest fmt {} num {} endian {} "
+      "exp_bias {} swap {} array {} sample {} | extent 0x{:08X}+{}",
+      resolve_info.copy_dest_base, resolve_info.coordinate_info.width_div_8 * 8,
+      resolve_info.height_div_8 * 8, depth ? "depth" : "color", static_cast<u32>(src.format),
+      kMsaa[static_cast<u32>(src.msaa_samples) & 3], static_cast<u32>(src.pitch_tiles),
+      static_cast<u32>(src.base_tiles), static_cast<u32>(dest.copy_dest_format),
+      static_cast<u32>(dest.copy_dest_number), static_cast<u32>(dest.copy_dest_endian),
+      static_cast<i32>(dest.copy_dest_exp_bias), static_cast<u32>(dest.copy_dest_swap),
+      static_cast<u32>(dest.copy_dest_array),
+      static_cast<u32>(resolve_info.copy_dest_coordinate_info.copy_sample_select),
+      resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
+  Entry& e = entries[text];
+  if (e.text.empty()) {
+    e.text = text;
+  }
+  ++e.count;
+  ++total;
+  std::time_t now = std::time(nullptr);
+  if (now - window_start < 10) {
+    return;
+  }
+  double secs = static_cast<double>(now - window_start);
+  std::vector<const Entry*> sorted;
+  for (const auto& [k, v] : entries) {
+    sorted.push_back(&v);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const Entry* a, const Entry* b) { return a->count > b->count; });
+  std::FILE* out = nullptr;
+  if (fopen_s(&out, "mp_resolve.txt", "a") == 0 && out) {
+    std::tm tm_local;
+    localtime_s(&tm_local, &now);
+    std::fprintf(out, "%02d:%02d:%02d %.0fs resolves/s=%.1f distinct=%zu\n", tm_local.tm_hour,
+                 tm_local.tm_min, tm_local.tm_sec, secs, total / secs, entries.size());
+    for (size_t i = 0; i < sorted.size() && i < 24; ++i) {
+      std::fprintf(out, "  %6.1f/s %s\n", sorted[i]->count / secs, sorted[i]->text.c_str());
+    }
+    std::fclose(out);
+  }
+  entries.clear();
+  total = 0;
+  window_start = now;
+}
+
 bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache, u32& written_address_out,
                                      u32& written_length_out) {
@@ -1206,6 +1586,10 @@ bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory&
 
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
+  }
+  if (command_processor_.GetD3D12Settings().texture_load_census.Get() &&
+      resolve_info.copy_dest_extent_length) {
+    ResolveCensusRecord(resolve_info);
   }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
@@ -1328,6 +1712,10 @@ bool D3D12RenderTargetCache::Resolve(IPhysicalMemory& memory, D3D12SharedMemory&
 
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          if (!draw_resolution_scaled &&
+              command_processor_.GetD3D12Settings().resolve_to_texture.Get()) {
+            TryResolveToTexture(resolve_info, texture_cache);
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -3523,6 +3911,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     if (any_work) {
       command_processor_.GuardAsyncReplay(4);
       replay_lock = command_processor_.LockAsyncReplay(4);
+    } else if (command_processor_.GetXenosSettings().render_target_update_fast_path.Get()) {
+      // No transfers and no clear: everything below only iterates the empty transfer lists.
+      return;
     }
   }
 
@@ -5103,6 +5494,7 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_state::ResolveReq
 
 bool D3D12RenderTargetCache::DumpRenderTargets(u32 dump_base, u32 dump_row_length_used,
                                                u32 dump_rows, u32 dump_pitch) {
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kResolveDump);
   REX_ASSERT(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,

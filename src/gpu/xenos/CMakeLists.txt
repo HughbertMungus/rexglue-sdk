@@ -203,6 +203,9 @@ if (REXGLUE_GPU_D3D12)
     ${REXGPU_XENOS_D3D12_ALL}
   )
   target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE REX_GPU_XENOS_STATIC)
+  # Per-draw Tracy zones in profiling builds only (bo2-dev CPU profiling).
+  target_compile_definitions(rexgpu-xenos-d3d12 PRIVATE
+    $<$<NOT:$<CONFIG:Release>>:REXGPU_FINE_GRAINED_DRAW_SCOPES=1>)
   target_link_libraries(
     rexgpu-xenos-d3d12
     PRIVATE rexgpu-xenos-base

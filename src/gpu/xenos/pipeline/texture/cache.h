@@ -207,6 +207,8 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
       return mips_outdated_;
     }
     void UpdateAndWatch(const ScopeGuard& watch_lock);
+    /** Frame (TextureCache::BeginFrame count) of the last load that left a part CPU-stale. */
+    u64 GetCpuStaleFrame() const { return cpu_stale_frame_; }
 
     void WatchCallback(bool is_mip);
 
@@ -246,6 +248,7 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
     std::atomic<u32> outdated_mask_{0};
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+    u64 cpu_stale_frame_ = UINT64_MAX;
   };
 
   /**
@@ -413,7 +416,19 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
    * @param key Key of the texture, possibly adjusted to fit host limits.
    * @return Texture, or null if the key is unsupported or creation failed.
    */
-  Texture* FindOrCreateTexture(TextureKey key);
+  /** How FindOrCreateTexture decided whether the key is a scaled resolve (memo validation). */
+  struct ScaledResolveDecision {
+    bool checked = false;  // Whether the memory ranges below decide it at all.
+    bool scaled = false;
+    u32 base_extent = 0;
+    u32 mips_extent = 0;
+  };
+  Texture* FindOrCreateTexture(TextureKey key, ScaledResolveDecision* decision_out = nullptr);
+  /**
+   * FindOrCreateTexture through a small set associative memo (xenos.texture_lookup_memo). Entries
+   * are dropped when their texture is destroyed; the scaled resolve decision is rechecked on hits.
+   */
+  Texture* FindOrCreateTextureMemoized(const TextureKey& key);
 
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     REX_ASSERT(load_shader_index < kLoadShaderCount);
@@ -512,6 +527,31 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
 
   u64 current_submission_index_ = 0;
+  /** Number of BeginFrame calls, for once-per-frame reloads of CPU-written textures. */
+  u64 frame_index_ = 0;
+
+  /** Recent resolve destinations (MarkRangeAsResolved), for attributing texture loads. */
+  struct RecentResolve {
+    u32 start = 0;
+    u32 length = 0;
+    u64 frame = 0;
+  };
+  std::array<RecentResolve, 128> recent_resolves_{};
+  u32 recent_resolve_next_ = 0;
+
+ public:
+  /** Whether a resolve wrote any of the range in this or the previous frame. */
+  bool WasRangeRecentlyResolved(u32 start, u32 length) const;
+  /** Every texture whose level 0 starts at the page (resolve_to_texture). */
+  void FindTexturesAtBasePage(u32 base_page, std::vector<Texture*>& out) const;
+  /** The current frame, counted by BeginFrame. */
+  u64 GetFrameIndex() const { return frame_index_; }
+
+ private:
+  std::unordered_multimap<u32, Texture*> textures_by_base_page_;
+  void ForgetTextureBasePage(const Texture& texture);
+
+ private:
   u64 current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
@@ -535,6 +575,26 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
 
   /** Bumped when a texture used in the current frame is destroyed (see GetTextureDestroyEpoch). */
   u64 texture_destroy_epoch_ = 0;
+
+  struct TextureLookupMemoEntry {
+    TextureKey key;
+    Texture* texture = nullptr;
+    u64 generation = 0;
+    ScaledResolveDecision decision;
+  };
+  // 2-way set associative, 1024 entries; mru = the way hit or filled last.
+  struct TextureLookupMemoSet {
+    TextureLookupMemoEntry ways[2];
+    u32 mru = 0;
+  };
+  static constexpr u32 kTextureLookupMemoSetCount = 512;
+  std::array<TextureLookupMemoSet, kTextureLookupMemoSetCount> texture_lookup_memo_;
+  /** Bumped when all textures are destroyed, invalidating every memo entry. */
+  u64 texture_lookup_memo_generation_ = 1;
+  u64 texture_lookup_memo_hits_ = 0;
+  u64 texture_lookup_memo_misses_ = 0;
+  /** Memo entries dropped because their texture was destroyed (fps log tlg=). */
+  u64 texture_lookup_memo_invalidations_ = 0;
   /** current_submission_index_ at BeginFrame: textures used at or after it were used this frame. */
   u64 frame_first_submission_index_ = 0;
 
@@ -546,6 +606,10 @@ class REX_GPU_XENOS_API TextureCache : public rex::NonCopyable {
    * changes, even if the keys still match.
    */
   u64 GetTextureDestroyEpoch() const { return texture_destroy_epoch_; }
+  /** Cumulative texture lookup memo hits and misses (fps log tlh= / tlm=). */
+  u64 GetTextureLookupMemoHits() const { return texture_lookup_memo_hits_; }
+  u64 GetTextureLookupMemoMisses() const { return texture_lookup_memo_misses_; }
+  u64 GetTextureLookupMemoInvalidations() const { return texture_lookup_memo_invalidations_; }
 };
 
 }  // namespace rex::gpu

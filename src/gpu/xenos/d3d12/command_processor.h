@@ -280,12 +280,18 @@ class D3D12CommandProcessor : public CommandProcessor {
            " tdr=" +
            std::to_string(texture_descriptor_rewrites_after_destroy_.load(std::memory_order_relaxed)) +
            TextureBindDiagnosticTags() +
+           (texture_cache_ ? texture_cache_->ResolveToTextureLogTags() : std::string()) + " tpf=" +
+           std::to_string(GetXenosSettings().texture_cpu_written_reload_per_frame.Get() ? 1 : 0) +
+           " tsf=" +
+           std::to_string(GetXenosSettings().texture_cpu_written_reload_skip_same_frame.Get() ? 1 : 0) +
            GpuProfLogTags();
   }
   /** tnl= / tod= (cumulative): textures bound never loaded / still outdated (texture cache). */
   std::string TextureBindDiagnosticTags() const;
   /** gp_* fields (ms per profiled frame by category) while GPU profiling is on; resets them. */
   std::string GpuProfLogTags() const;
+  /** Per-pass profile: sets the GPU profiling category of the next draw by its render targets. */
+  void GpuProfSetDrawPass();
 
   Shader* LoadShader(xenos::ShaderType shader_type, u32 guest_address, const u32* host_address,
                      u32 dword_count) override;

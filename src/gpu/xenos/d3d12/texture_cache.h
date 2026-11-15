@@ -12,7 +12,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
+#include <string>
 #include <memory>
 #include <list>
 #include <unordered_map>
@@ -31,6 +33,7 @@
 #include <rex/xenos/fetch.h>
 #include <rex/xenos/format.h>
 #include "gpu/xenos/host/d3d12/d3d12_api.h"
+#include "gpu/xenos/host/d3d12/d3d12_cpu_descriptor_pool.h"
 #include "gpu/xenos/host/d3d12/d3d12_provider.h"
 
 namespace rex::gpu::d3d12 {
@@ -52,6 +55,29 @@ class D3D12TextureCache final : public TextureCache {
    * never loaded (their resource holds uninitialised or recycled memory), and textures bound while
    * still outdated after the request (sampled with stale data).
    */
+  /**
+   * resolve_to_texture: the texture a resolve can write directly (or, in verify mode, its shadow).
+   * Prepare finds an exactly matching texture and transitions the resource to RENDER_TARGET;
+   * Finish marks the texture as loaded (or, in verify mode, schedules a comparison).
+   */
+  struct ResolveToTextureTarget {
+    Texture* texture = nullptr;
+    ID3D12Resource* resource = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+    DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
+    u32 width = 0;
+    u32 height = 0;
+    bool verify = false;
+  };
+  bool PrepareResolveToTexture(u32 base_address, u32 width, u32 height, u32 pitch_div_32,
+                               xenos::Endian128 endian, xenos::TextureFormat texture_format,
+                               ResolveToTextureTarget& target_out);
+  void FinishResolveToTexture(const ResolveToTextureTarget& target);
+  /** Called at every frame start: records and evaluates the verify comparisons. */
+  void ResolveToTextureVerifyTick();
+  /** fps log rtt_n= rtt_ok= rtt_bad= rtt_swap= (cumulative). */
+  std::string ResolveToTextureLogTags() const;
+
   u64 GetUnloadedTextureBinds() const { return unloaded_texture_binds_.load(std::memory_order_relaxed); }
   u64 GetOutdatedTextureBinds() const { return outdated_texture_binds_.load(std::memory_order_relaxed); }
 
@@ -307,6 +333,42 @@ class D3D12TextureCache final : public TextureCache {
   std::atomic<u64> outdated_texture_binds_{0};
   u32 unloaded_texture_binds_logged_ = 0;
   void CheckBoundTextureLoaded(const Texture& texture, u32 fetch_constant_index);
+  /** gpu.d3d12.texture_load_census: counts one load, writes mp_texload.txt every 10 seconds. */
+  void TextureLoadCensusRecord(const Texture& texture, bool load_base, bool load_mips);
+
+  // resolve_to_texture state.
+  std::shared_ptr<gpu::d3d12::D3D12CPUDescriptorPool> resolve_rtv_pool_;
+  struct ResolveRTV {
+    ID3D12Resource* resource = nullptr;
+    gpu::d3d12::D3D12CPUDescriptorPool::Descriptor descriptor;
+  };
+  std::unordered_map<const Texture*, ResolveRTV> resolve_rtvs_;
+  struct ResolveShadow {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    gpu::d3d12::D3D12CPUDescriptorPool::Descriptor rtv;
+    u64 blit_frame = 0;
+    u64 load_generation_at_blit = 0;
+    u32 blits_in_frame = 0;
+    u64 last_compare_time = 0;
+  };
+  std::unordered_map<const Texture*, ResolveShadow> resolve_shadows_;
+  struct ResolveCompare {
+    const Texture* texture = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    u64 submission = 0;
+    u32 width = 0, height = 0;
+    u64 row_pitch = 0;
+    u64 offset_shadow = 0;
+    u32 base_address = 0;
+  };
+  std::vector<ResolveCompare> resolve_compares_;
+  u64 resolve_compare_next_time_ = 0;
+  std::atomic<u64> resolve_direct_count_{0};
+  std::atomic<u64> resolve_verify_ok_{0};
+  std::atomic<u64> resolve_verify_bad_{0};
+  std::atomic<u64> resolve_verify_swap_{0};
+  std::unordered_map<u64, u32> resolve_verify_logged_by_size_;
 
   std::list<RecycledResource> recycle_lru_;
   std::unordered_map<RecycleKey, std::vector<std::list<RecycledResource>::iterator>,

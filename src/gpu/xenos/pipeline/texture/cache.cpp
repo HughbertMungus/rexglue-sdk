@@ -117,11 +117,23 @@ void TextureCache::CompletedSubmissionUpdated(u64 completed_submission_index) {
     if (texture->GetLastUsageSubmissionIndex() >= frame_first_submission_index_) {
       ++texture_destroy_epoch_;
     }
+    // Drop only the memo entries leading to this texture (textures are destroyed hundreds of
+    // times a second, so invalidating the whole memo would empty it constantly).
+    for (TextureLookupMemoSet& memo_set : texture_lookup_memo_) {
+      for (TextureLookupMemoEntry& memo_entry : memo_set.ways) {
+        if (memo_entry.texture == texture) {
+          memo_entry.texture = nullptr;
+          memo_entry.generation = 0;
+          ++texture_lookup_memo_invalidations_;
+        }
+      }
+    }
     OnTextureEvicted(*texture);
     auto found_texture_it = textures_.find(texture->GetKey());
     REX_ASSERT(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       REX_ASSERT(found_texture_it->second.get() == texture);
+      ForgetTextureBasePage(*texture);
       textures_.erase(found_texture_it);
     }
   }
@@ -137,8 +149,37 @@ void TextureCache::BeginSubmission(u64 new_submission_index) {
 }
 
 void TextureCache::BeginFrame() {
+  ++frame_index_;
   frame_first_submission_index_ = current_submission_index_;
   ResetTextureBindings();
+}
+
+void TextureCache::ForgetTextureBasePage(const Texture& texture) {
+  auto range = textures_by_base_page_.equal_range(static_cast<u32>(texture.GetKey().base_page));
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second == &texture) {
+      textures_by_base_page_.erase(it);
+      return;
+    }
+  }
+}
+
+void TextureCache::FindTexturesAtBasePage(u32 base_page, std::vector<Texture*>& out) const {
+  out.clear();
+  auto range = textures_by_base_page_.equal_range(base_page);
+  for (auto it = range.first; it != range.second; ++it) {
+    out.push_back(it->second);
+  }
+}
+
+bool TextureCache::WasRangeRecentlyResolved(u32 start, u32 length) const {
+  for (const RecentResolve& r : recent_resolves_) {
+    if (r.length && r.frame + 1 >= frame_index_ && start < r.start + r.length &&
+        r.start < start + length) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void TextureCache::MarkRangeAsResolved(u32 start_unscaled, u32 length_unscaled) {
@@ -147,6 +188,12 @@ void TextureCache::MarkRangeAsResolved(u32 start_unscaled, u32 length_unscaled) 
   }
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
+  {
+    RecentResolve& r = recent_resolves_[recent_resolve_next_++ % recent_resolves_.size()];
+    r.start = start_unscaled;
+    r.length = length_unscaled;
+    r.frame = frame_index_;
+  }
 
   if (IsDrawResolutionScaled()) {
     u32 page_first = start_unscaled >> 12;
@@ -192,6 +239,13 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
                                       size_t& pending_range_count_out) {
   u32 outdated_mask = texture.GetOutdatedMask();
   if (!outdated_mask) {
+    return false;
+  }
+  // Already reloaded this frame and left outdated only because the CPU keeps writing it: the
+  // next frame reloads it (texture_cpu_written_reload_skip_same_frame).
+  if (texture.GetCpuStaleFrame() == frame_index_ &&
+      settings_.texture_cpu_written_reload_per_frame.Get() &&
+      settings_.texture_cpu_written_reload_skip_same_frame.Get()) {
     return false;
   }
 
@@ -265,6 +319,12 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   return true;
 }
 
+#ifdef REXGLUE_ENABLE_PROFILING
+#define REXGPU_TEX_ZONE(var, name) ZoneNamedN(var, name, TracyIsStarted)
+#else
+#define REXGPU_TEX_ZONE(var, name)
+#endif
+
 void TextureCache::RequestTextures(u32 used_texture_mask) {
   const auto& regs = GetRegisterFile();
 
@@ -295,6 +355,8 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
     }
   };
+  {
+  REXGPU_TEX_ZONE(rexgpu_tex_slots, "tex_slots");
   u32 textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
   u32 index = 0;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
@@ -331,7 +393,7 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
       // Previous signedness, not binding.texture, is checked so failed loads are not retried.
       if (any_sign_is_not_signed) {
         if (key_changed || !any_sign_was_not_signed) {
-          binding.texture = FindOrCreateTexture(binding.key);
+          binding.texture = FindOrCreateTextureMemoized(binding.key);
           load_unsigned_data = true;
         }
       } else {
@@ -341,7 +403,7 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
         if (key_changed || !any_sign_was_signed) {
           TextureKey signed_key = binding.key;
           signed_key.signed_separate = 1;
-          binding.texture_signed = FindOrCreateTexture(signed_key);
+          binding.texture_signed = FindOrCreateTextureMemoized(signed_key);
           load_signed_data = true;
         }
       } else {
@@ -349,7 +411,7 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
       }
     } else {
       if (key_changed) {
-        binding.texture = FindOrCreateTexture(binding.key);
+        binding.texture = FindOrCreateTextureMemoized(binding.key);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -361,12 +423,15 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
   }
+  }
 
   REX_PROFILE_PLOT("gpu/texture_cache/request_textures_pending_load_count",
                    static_cast<u32>(pending_texture_loads.size()));
   REX_PROFILE_PLOT("gpu/texture_cache/request_textures_pending_range_count",
                    static_cast<u32>(pending_shared_memory_ranges.size()));
 
+  if (!pending_texture_loads.empty() || !pending_shared_memory_ranges.empty()) {
+  REXGPU_TEX_ZONE(rexgpu_tex_loads, "tex_loads");
   bool batched_shared_memory_request_succeeded = true;
   std::vector<std::pair<u32, u32>> pending_shared_memory_range_pairs;
   if (!pending_shared_memory_ranges.empty()) {
@@ -389,7 +454,9 @@ void TextureCache::RequestTextures(u32 used_texture_mask) {
       }
     }
   }
+  }
   if (bindings_changed) {
+    REXGPU_TEX_ZONE(rexgpu_tex_host_bindings, "tex_host_bindings");
     UpdateHostTextureBindings(bindings_changed);
   }
 }
@@ -517,7 +584,15 @@ void TextureCache::Texture::UpdateAndWatch(const ScopeGuard& watch_lock) {
       part_stale = true;
     }
   }
+  // A part the CPU wrote again since the upload stays outdated. By default the next draw reloads it
+  // (every binding is reset); with texture_cpu_written_reload_per_frame the reload waits for the
+  // next frame, whose BeginFrame resets the bindings anyway - one load per frame instead of one per
+  // draw that binds it (BO2: a 2 MB 3D texture otherwise loaded ~11 times a frame).
   if (part_stale) {
+    cpu_stale_frame_ = GetTextureCache().frame_index_;
+  }
+  if (part_stale &&
+      !GetTextureCache().GetXenosSettings().texture_cpu_written_reload_per_frame.Get()) {
     GetTextureCache().texture_became_outdated_.store(true, std::memory_order_release);
   }
 }
@@ -570,12 +645,15 @@ void TextureCache::WatchCallback(void* context, [[maybe_unused]] void* data, u64
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ++texture_destroy_epoch_;
+  ++texture_lookup_memo_generation_;
   ResetTextureBindings(from_destructor);
+  textures_by_base_page_.clear();
   textures_.clear();
   REX_PROFILE_PLOT("gpu/texture_cache/textures", 0);
 }
 
-TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key,
+                                                         ScaledResolveDecision* decision_out) {
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
     xenos::GuestTextureLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
@@ -586,6 +664,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
                                scaled_resolve_guest_layout.mips_total_extent_bytes))) {
       key.scaled_resolve = 1;
     }
+    if (decision_out) {
+      decision_out->checked = true;
+      decision_out->scaled = key.scaled_resolve != 0;
+      decision_out->base_extent = scaled_resolve_guest_layout.base.level_data_extent_bytes;
+      decision_out->mips_extent = scaled_resolve_guest_layout.mips_total_extent_bytes;
+    }
+  } else if (decision_out) {
+    *decision_out = ScaledResolveDecision();
   }
 
   auto get_host_extent = [this, &key](u32& host_width_out, u32& host_height_out,
@@ -680,9 +766,65 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     REX_ASSERT(new_texture->GetKey() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    textures_by_base_page_.emplace(static_cast<u32>(key.base_page), texture);
   }
   REX_PROFILE_PLOT("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
+  return texture;
+}
+
+TextureCache::Texture* TextureCache::FindOrCreateTextureMemoized(const TextureKey& key) {
+  if (!settings_.texture_lookup_memo.Get()) {
+    return FindOrCreateTexture(key);
+  }
+  u32 words[sizeof(TextureKey) / sizeof(u32)];
+  std::memcpy(words, &key, sizeof(words));
+  u32 hash = 0;
+  for (u32 word : words) {
+    hash = (hash ^ word) * UINT32_C(0x9E3779B1);
+  }
+  hash ^= hash >> 16;
+  TextureLookupMemoSet& set = texture_lookup_memo_[hash % kTextureLookupMemoSetCount];
+  u32 way = 0;
+  for (; way < 2; ++way) {
+    const TextureLookupMemoEntry& candidate = set.ways[way];
+    if (candidate.generation == texture_lookup_memo_generation_ && candidate.key == key) {
+      break;
+    }
+  }
+  if (way < 2) {
+    // The scaled resolve state of the memory may have changed since: recheck it the same way
+    // FindOrCreateTexture does, with the layout extents it computed.
+    const TextureLookupMemoEntry& hit = set.ways[way];
+    const ScaledResolveDecision& decision = hit.decision;
+    bool scaled = decision.checked &&
+                  ((decision.base_extent &&
+                    IsRangeScaledResolved(key.base_page << 12, decision.base_extent)) ||
+                   (decision.mips_extent &&
+                    IsRangeScaledResolved(key.mip_page << 12, decision.mips_extent)));
+    if (scaled == decision.scaled) {
+      ++texture_lookup_memo_hits_;
+      set.mru = way;
+      return hit.texture;
+    }
+  } else {
+    // Replace an invalid way first, otherwise the least recently used one.
+    way = set.ways[0].generation != texture_lookup_memo_generation_   ? 0
+          : set.ways[1].generation != texture_lookup_memo_generation_ ? 1
+                                                                      : 1 - set.mru;
+  }
+  TextureLookupMemoEntry& entry = set.ways[way];
+  ++texture_lookup_memo_misses_;
+  ScaledResolveDecision decision;
+  Texture* texture = FindOrCreateTexture(key, &decision);
+  if (texture) {
+    // The generation is read after the lookup, which may have destroyed other textures.
+    entry.key = key;
+    entry.texture = texture;
+    entry.generation = texture_lookup_memo_generation_;
+    entry.decision = decision;
+    set.mru = way;
+  }
   return texture;
 }
 

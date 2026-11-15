@@ -152,6 +152,9 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
   bool IsLastUpdateMsaa4xAs1x() const { return last_update_msaa_4x_as_1x_; }
   /** The last Update would have redirected, but the draw was not eligible (see below). */
   bool IsLastUpdateMsaa4xAs1xRefused() const { return last_update_msaa_4x_as_1x_refused_; }
+  /** Cumulative fast path updates and (verify mode) disagreements: fps log rfh= / rfm=. */
+  u64 GetUpdateFastPathHits() const { return update_fast_hits_; }
+  u64 GetUpdateFastPathMismatches() const { return update_fast_mismatches_; }
   /**
    * Set before each Update: whether the draw may be redirected - only clear-like draws (no
    * texture sampling, no pixel position input), whose result does not depend on the pixel scale.
@@ -628,6 +631,26 @@ class REX_GPU_XENOS_API RenderTargetCache : public rex::NonCopyable {
   bool are_accumulated_render_targets_valid_ = false;
   /** Transfer sources for each render target after an update, grouped by source. */
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  /**
+   * Changes whenever EDRAM ownership or the set of render targets may have changed, so an
+   * update with the inputs of the last full one, extending no further, would change nothing
+   * (xenos.render_target_update_fast_path).
+   */
+  u64 ownership_version_ = 1;
+  struct UpdateFastPathState {
+    bool valid = false;
+    u64 ownership_version = 0;
+    u32 rts_used_bits = 0;
+    u32 pitch_tiles_at_32bpp = 0;
+    xenos::MSAASamples msaa_samples = xenos::MSAASamples::k1X;
+    u32 edram_bases[1 + xenos::kMaxColorRenderTargets] = {};
+    u32 resource_formats[1 + xenos::kMaxColorRenderTargets] = {};
+    u32 lengths_tiles[1 + xenos::kMaxColorRenderTargets] = {};
+  };
+  UpdateFastPathState update_fast_;
+  u64 update_fast_hits_ = 0;
+  u64 update_fast_mismatches_ = 0;
 };
 
 }  // namespace rex::gpu

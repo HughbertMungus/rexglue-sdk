@@ -33,7 +33,22 @@ class D3D12CommandProcessor;
  * consecutive timestamps is attributed to the earlier one's category.
  */
 struct GpuProf {
-  enum : u8 { kOther = 0, kDraw, kRtTransfer, kResolve, kTexLoad, kUpload, kPresent, kCount };
+  // kTexLoadResolved: texture loads of data a resolve wrote in this or the previous frame.
+  enum : u8 {
+    kOther = 0,
+    kDraw,
+    kRtTransfer,
+    kResolve,
+    kTexLoad,
+    kUpload,
+    kPresent,
+    kTexLoadResolved,
+    kResolveDump,
+    kCount
+  };
+  /** Categories from kPassBase up are draws, by the render targets bound (per-pass profile). */
+  static constexpr u32 kPassBase = 32;
+  static constexpr u32 kPassCount = 256 - kPassBase;
   static constexpr u32 kMax = 32768;
   ID3D12QueryHeap* heap = nullptr;
   bool active = false;

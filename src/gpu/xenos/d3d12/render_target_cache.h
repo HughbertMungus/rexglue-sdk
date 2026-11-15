@@ -94,6 +94,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
    * @param written_address_out Receives the start of the written range.
    * @param written_length_out Receives the length of the written range.
    */
+  /** gpu.d3d12.texture_load_census: counts one resolve, writes mp_resolve.txt every 10 s. */
+  void ResolveCensusRecord(const draw_state::ResolveRequest& resolve_info);
+  /** The render targets of the last Update (depth, then colors), for the per-pass GPU profile. */
+  auto GetUsedRenderTargetsForProfile() const { return GetLastUpdateUsedRenderTargets(); }
+  /** resolve_to_texture: after a resolve, copies the host render target into the texture. */
+  void TryResolveToTexture(const draw_state::ResolveRequest& resolve_info,
+                           D3D12TextureCache& texture_cache);
   bool Resolve(IPhysicalMemory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, u32& written_address_out, u32& written_length_out);
 
@@ -722,6 +729,17 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   /** Parameter 0 is 2 root constants (red, green). */
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;
+  // resolve_to_texture blit, created on first use (pixel shader compiled with D3DCompile).
+  ID3D12RootSignature* resolve_to_texture_root_signature_ = nullptr;
+  // Blit pipelines: [0] color R8G8B8A8, [1] color R10G10B10A2, [2] depth to R32_FLOAT,
+  // [3] depth to R8G8B8A8.
+  ID3D12PipelineState* resolve_to_texture_pipelines_[4] = {};
+  bool resolve_to_texture_init_failed_ = false;
+  bool InitializeResolveToTexture();
+  void ResolveToTextureBlit(D3D12RenderTarget& render_target, D3D12TextureCache& texture_cache,
+                            const D3D12TextureCache::ResolveToTextureTarget& target,
+                            u32 pipeline_index, u32 source_x, u32 source_y, bool swap_rb,
+                            u32 flags);
   /** Indexed by [32 or 32_32][MSAA samples]. */
   ID3D12PipelineState*
       uint32_rtv_clear_pipelines_[2][static_cast<size_t>(xenos::MSAASamples::k4X) + 1] = {};

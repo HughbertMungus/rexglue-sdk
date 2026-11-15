@@ -26,6 +26,7 @@
 #include <rex/xenos/state.h>
 #include <rex/logging/log_category.h>
 #include <rex/bit.h>
+#include <rex/platform/perf.h>
 
 namespace rex::gpu {
 
@@ -296,6 +297,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets() noexcept {
+  ++ownership_version_;
   ownership_ranges_.clear();
   render_targets_.clear();
 }
@@ -305,6 +307,7 @@ void RenderTargetCache::ShutdownCommon() noexcept {
 }
 
 void RenderTargetCache::ClearCache() {
+  ++ownership_version_;
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
     for (const auto& ownership_range_pair : ownership_ranges_) {
@@ -338,6 +341,12 @@ void RenderTargetCache::ClearCache() {
 void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
+
+#ifdef REXGLUE_ENABLE_PROFILING
+#define REXGPU_RT_ZONE(var, name) ZoneNamedN(var, name, TracyIsStarted)
+#else
+#define REXGPU_RT_ZONE(var, name)
+#endif
 
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                xenos::reg::RB_DEPTHCONTROL normalized_depth_control,
@@ -450,6 +459,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   }
 
   if (!depth_and_color_rts_used_bits) {
+    // The used render targets change, so the fast path state no longer describes them.
+    update_fast_.valid = false;
     std::ranges::fill(last_update_used_render_targets_, nullptr);
     if (are_accumulated_render_targets_valid_) {
       for (const RenderTarget* render_target : last_update_accumulated_render_targets_) {
@@ -470,6 +481,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     return true;
   }
 
+  REXGPU_RT_ZONE(rexgpu_rt_rest, "rt_base_after_regs");
   u32 height_used =
       std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
                draw_extent_estimator_.EstimateMaxY(
@@ -530,6 +542,52 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                        rt_base);
   }
 
+  // Fast path: the same render targets as the last full update, no ownership change since and
+  // no further extent - every range is already owned by these targets, so the lookups and
+  // ownership changes below would find and change nothing and produce no transfers. 4x draws
+  // that may be redirected to 1x targets always take the full path.
+  u32 update_lengths_tiles[1 + xenos::kMaxColorRenderTargets] = {};
+  for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
+    update_lengths_tiles[edram_bases_sorted[i].second] = rt_lengths_tiles[i];
+  }
+  const bool fast_path_eligible =
+      !interlock_barrier_only && settings_.render_target_update_fast_path.Get() &&
+      !(msaa_samples == xenos::MSAASamples::k4X && IsMsaa4xAs1xEnabled());
+  bool fast_path_applies = false;
+  if (fast_path_eligible && update_fast_.valid && are_accumulated_render_targets_valid_ &&
+      update_fast_.ownership_version == ownership_version_ &&
+      update_fast_.rts_used_bits == depth_and_color_rts_used_bits &&
+      update_fast_.pitch_tiles_at_32bpp == pitch_tiles_at_32bpp &&
+      update_fast_.msaa_samples == msaa_samples) {
+    fast_path_applies = true;
+    for (u32 i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(depth_and_color_rts_used_bits & (UINT32_C(1) << i))) {
+        continue;
+      }
+      if (update_fast_.edram_bases[i] != edram_bases[i] ||
+          update_fast_.resource_formats[i] != resource_formats[i] ||
+          update_lengths_tiles[i] > update_fast_.lengths_tiles[i]) {
+        fast_path_applies = false;
+        break;
+      }
+    }
+  }
+  const bool fast_path_verify =
+      fast_path_applies && settings_.render_target_update_fast_path_verify.Get();
+  RenderTarget* fast_path_used[1 + xenos::kMaxColorRenderTargets];
+  if (fast_path_applies) {
+    ++update_fast_hits_;
+    if (!fast_path_verify) {
+      // last_update_used_render_targets_ and the accumulated ones are those of the last
+      // update with these inputs, and the transfer lists were cleared above.
+      last_update_msaa_4x_as_1x_ = false;
+      last_update_msaa_4x_as_1x_refused_ = false;
+      return true;
+    }
+    std::copy(std::begin(last_update_used_render_targets_),
+              std::end(last_update_used_render_targets_), fast_path_used);
+  }
+
   // 4x view of a 1x surface (e.g. the Xbox 360 D3D clear of a 1x surface through a half-size 4x
   // view): the 4x and 1x keys with the same base, pitch and format cover the same EDRAM samples one
   // to one. If the 1x target already owns every range and the 4x one would need transfers, draw
@@ -562,6 +620,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
   }
   if (!interlock_barrier_only) {
+    REXGPU_RT_ZONE(rexgpu_rt_get, "rt_get");
     for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
       u32 rt_bit_index = edram_bases_sorted[i].second;
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_keys[rt_bit_index]);
@@ -590,11 +649,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   // Transfers are assumed to succeed from here on, even if the implementation fails them.
 
+  {
+  REXGPU_RT_ZONE(rexgpu_rt_ownership, "rt_ownership");
   for (u32 i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<u32, u32>& rt_base_index = edram_bases_sorted[i];
     u32 rt_bit_index = rt_base_index.second;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+  }
   }
 
   if (interlock_barrier_only) {
@@ -650,6 +712,36 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     std::ranges::copy(last_update_used_render_targets_,
                       std::begin(last_update_accumulated_render_targets_));
     are_accumulated_render_targets_valid_ = true;
+  }
+
+  if (fast_path_verify) {
+    bool mismatch = !std::equal(std::begin(last_update_used_render_targets_),
+                                std::end(last_update_used_render_targets_), fast_path_used) ||
+                    last_update_msaa_4x_as_1x_;
+    for (const std::vector<Transfer>& transfers : last_update_transfers_) {
+      mismatch |= !transfers.empty();
+    }
+    if (mismatch && update_fast_mismatches_++ < 16) {
+      REXGPU_WARN("Render target update fast path disagrees with the full update (pitch {} "
+                  "msaa {} rts {:X})",
+                  pitch_tiles_at_32bpp, static_cast<u32>(msaa_samples),
+                  depth_and_color_rts_used_bits);
+    }
+  }
+  if (fast_path_eligible) {
+    update_fast_.valid = true;
+    update_fast_.ownership_version = ownership_version_;
+    update_fast_.rts_used_bits = depth_and_color_rts_used_bits;
+    update_fast_.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+    update_fast_.msaa_samples = msaa_samples;
+    for (u32 i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      bool used = (depth_and_color_rts_used_bits & (UINT32_C(1) << i)) != 0;
+      update_fast_.edram_bases[i] = used ? edram_bases[i] : 0;
+      update_fast_.resource_formats[i] = used ? resource_formats[i] : 0;
+      update_fast_.lengths_tiles[i] = update_lengths_tiles[i];
+    }
+  } else {
+    update_fast_.valid = false;
   }
 
   return true;
@@ -988,6 +1080,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
 }
 
 void RenderTargetCache::PixelShaderInterlockFullEDRAMBarrierPlaced() {
+  ++ownership_version_;
   REX_ASSERT(GetPath() == Path::kPixelShaderInterlock);
   OwnershipRange empty_range(xenos::kEDRAMTileCount, RenderTargetKey(), RenderTargetKey(),
                              RenderTargetKey());
@@ -1093,6 +1186,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, u32 start_tiles_ba
   if (length_tiles == 0) {
     return;
   }
+  ++ownership_version_;
   u32 dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&

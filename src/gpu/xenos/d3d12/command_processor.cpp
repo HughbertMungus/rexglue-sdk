@@ -11,6 +11,15 @@
 
 #include <bit>
 #include <algorithm>
+#include <ctime>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <intrin.h>
+#endif
+#include <format>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -39,6 +48,43 @@
 
 #define REXGPU_FINE_GRAINED_DRAW_SCOPES 1
 
+// Sequential Tracy zones splitting IssueDraw into phases (profiling builds only). Each
+// REXGPU_DRAW_PHASE ends the previous phase; the object ends the last one on any return.
+#if REXGPU_FINE_GRAINED_DRAW_SCOPES && defined(REXGLUE_ENABLE_PROFILING)
+#include <tracy/TracyC.h>
+namespace {
+struct DrawPhaseZone {
+  TracyCZoneCtx ctx{};
+  bool open = false;
+  // Ends the current phase before the next one begins: Tracy requires zones to nest.
+  void Next(const ___tracy_source_location_data* location) {
+    End();
+    ctx = ___tracy_emit_zone_begin(location, TracyIsStarted);
+    open = true;
+  }
+  void End() {
+    if (open) {
+      TracyCZoneEnd(ctx);
+      open = false;
+    }
+  }
+  ~DrawPhaseZone() { End(); }
+};
+}  // namespace
+#define REXGPU_DRAW_PHASE_DECLARE() DrawPhaseZone rexgpu_draw_phase
+#define REXGPU_DRAW_PHASE(name)                                                         \
+  do {                                                                                 \
+    static const ___tracy_source_location_data rexgpu_phase_loc = {name, __func__, __FILE__, \
+                                                                    __LINE__, 0};      \
+    rexgpu_draw_phase.Next(&rexgpu_phase_loc);                                           \
+  } while (0)
+#define REXGPU_DRAW_PHASE_END() rexgpu_draw_phase.End()
+#else
+#define REXGPU_DRAW_PHASE_DECLARE()
+#define REXGPU_DRAW_PHASE(name)
+#define REXGPU_DRAW_PHASE_END()
+#endif
+
 namespace rex::gpu::d3d12 {
 
 namespace shaders {
@@ -65,18 +111,97 @@ D3D12CommandProcessor::~D3D12CommandProcessor() = default;
 namespace {
 // GPU time per category summed over the profiled frames (ns), taken by GpuProfLogTags once a
 // second (gpu.d3d12.gpu_profile_interval, bo2-bisect perf/0028).
-std::atomic<u64> g_gpu_prof_ns[GpuProf::kCount];
+std::atomic<u64> g_gpu_prof_ns[256];
+// Per-pass report (mp_gpupass.txt every 10 profiled seconds): pass ids by render target set.
+std::mutex g_gpu_pass_mutex;
+std::unordered_map<u64, u32> g_gpu_pass_ids;
+std::vector<std::string> g_gpu_pass_names;
+u64 g_gpu_pass_ns[GpuProf::kPassCount] = {};
+u64 g_gpu_pass_frames = 0;
+u32 g_gpu_pass_reports = 0;
 std::atomic<u64> g_gpu_prof_frame_ns{0};
 std::atomic<u64> g_gpu_prof_frames{0};
 std::atomic<u64> g_gpu_prof_marks{0};
+// Per-draw CPU cost without Tracy (fps log dcy= TSC cycles per draw, dps= draws per second):
+// unaffected by what is on screen, so in-match A/B tests compare it instead of fps.
+std::atomic<u64> g_draw_cycles{0};
+std::atomic<u64> g_draw_count{0};
+inline u64 DrawCycleStamp() {
+#if defined(_M_X64) || defined(__x86_64__)
+  return __rdtsc();
+#else
+  return 0;
+#endif
+}
+struct DrawCycleScope {
+  u64 start = DrawCycleStamp();
+  ~DrawCycleScope() {
+    g_draw_cycles.fetch_add(DrawCycleStamp() - start, std::memory_order_relaxed);
+    g_draw_count.fetch_add(1, std::memory_order_relaxed);
+  }
+};
 }  // namespace
 
 std::string D3D12CommandProcessor::TextureBindDiagnosticTags() const {
   if (!texture_cache_) {
     return {};
   }
-  return " tnl=" + std::to_string(texture_cache_->GetUnloadedTextureBinds()) +
-         " tod=" + std::to_string(texture_cache_->GetOutdatedTextureBinds());
+  u64 draw_cycles = g_draw_cycles.exchange(0, std::memory_order_relaxed);
+  u64 draw_count = g_draw_count.exchange(0, std::memory_order_relaxed);
+  return " dcy=" + std::to_string(draw_count ? draw_cycles / draw_count : 0) +
+         " dps=" + std::to_string(draw_count) +
+         " tnl=" + std::to_string(texture_cache_->GetUnloadedTextureBinds()) +
+         " tod=" + std::to_string(texture_cache_->GetOutdatedTextureBinds()) +
+         " tlm=" + std::to_string(GetXenosSettings().texture_lookup_memo.Get() ? 1 : 0) +
+         " tlh=" + std::to_string(texture_cache_->GetTextureLookupMemoHits()) +
+         " tlx=" + std::to_string(texture_cache_->GetTextureLookupMemoMisses()) +
+         " tlg=" + std::to_string(texture_cache_->GetTextureLookupMemoInvalidations()) +
+         (render_target_cache_
+              ? " rff=" +
+                    std::to_string(GetXenosSettings().render_target_update_fast_path.Get() ? 1 : 0) +
+                    " rfh=" + std::to_string(render_target_cache_->GetUpdateFastPathHits()) +
+                    " rfm=" + std::to_string(render_target_cache_->GetUpdateFastPathMismatches())
+              : std::string());
+}
+
+void D3D12CommandProcessor::GpuProfSetDrawPass() {
+  if (!gpu_prof_.active || !render_target_cache_) {
+    return;
+  }
+  // The pass: the set of render targets the draw writes (depth and up to 4 colors).
+  auto rts = render_target_cache_->GetUsedRenderTargetsForProfile();
+  u64 key = 0;
+  for (u32 i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    u32 value = rts[i] ? rts[i]->GetKey().key : 0;
+    key = key * 0x9E3779B97F4A7C15ull + value + 1;
+  }
+  std::lock_guard<std::mutex> lock(g_gpu_pass_mutex);
+  auto it = g_gpu_pass_ids.find(key);
+  u32 id;
+  if (it != g_gpu_pass_ids.end()) {
+    id = it->second;
+  } else if (g_gpu_pass_names.size() < GpuProf::kPassCount - 1) {
+    id = static_cast<u32>(g_gpu_pass_names.size());
+    std::string name;
+    for (u32 i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!rts[i]) continue;
+      auto k = rts[i]->GetKey();
+      static const char* kMsaa[] = {"1x", "2x", "4x", "?"};
+      u32 width = k.pitch_tiles_at_32bpp * xenos::kEDRAMTileWidthSamples /
+                  (k.msaa_samples >= xenos::MSAASamples::k4X ? 2 : 1);
+      name += std::format("{}{} {}w {} @{}t {}  ", k.is_depth ? "d" : "c", i ? std::to_string(i - 1) : "",
+                          width, kMsaa[static_cast<u32>(k.msaa_samples) & 3],
+                          static_cast<u32>(k.base_tiles),
+                          k.is_depth ? xenos::GetDepthRenderTargetFormatName(k.GetDepthFormat())
+                                     : xenos::GetColorRenderTargetFormatName(k.GetColorFormat()));
+    }
+    g_gpu_pass_names.push_back(name.empty() ? std::string("(no render targets)") : name);
+    g_gpu_pass_ids.emplace(key, id);
+  } else {
+    id = GpuProf::kPassCount - 1;
+    if (g_gpu_pass_names.size() < GpuProf::kPassCount) g_gpu_pass_names.push_back("(other passes)");
+  }
+  gpu_prof_.category = static_cast<u8>(GpuProf::kPassBase + id);
 }
 
 std::string D3D12CommandProcessor::GpuProfLogTags() const {
@@ -103,15 +228,60 @@ std::string D3D12CommandProcessor::GpuProfLogTags() const {
     const u64 ns = g_gpu_prof_ns[c].exchange(0, std::memory_order_relaxed);
     ms[c] = frames ? static_cast<double>(ns) / 1e6 / static_cast<double>(frames) : 0.0;
   }
-  char text[256];
+  u64 pass_ns_sum = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_gpu_pass_mutex);
+    for (u32 p = 0; p < GpuProf::kPassCount; ++p) {
+      const u64 pass_ns =
+          g_gpu_prof_ns[GpuProf::kPassBase + p].exchange(0, std::memory_order_relaxed);
+      g_gpu_pass_ns[p] += pass_ns;
+      pass_ns_sum += pass_ns;
+    }
+    g_gpu_pass_frames += frames;
+    if (++g_gpu_pass_reports >= 10 && g_gpu_pass_frames) {
+      std::vector<std::pair<u64, u32>> order;
+      for (u32 p = 0; p < GpuProf::kPassCount && p < g_gpu_pass_names.size(); ++p) {
+        if (g_gpu_pass_ns[p]) order.emplace_back(g_gpu_pass_ns[p], p);
+      }
+      std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
+      std::FILE* out = nullptr;
+      if (fopen_s(&out, "mp_gpupass.txt", "a") == 0 && out) {
+        std::time_t t = std::time(nullptr);
+        std::tm tm_local;
+        localtime_s(&tm_local, &t);
+        u64 total = 0;
+        for (auto& o : order) total += o.first;
+        std::fprintf(out, "%02d:%02d:%02d frames=%llu draws_total=%.3f ms/frame passes=%zu\n",
+                     tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
+                     static_cast<unsigned long long>(g_gpu_pass_frames),
+                     total / 1e6 / g_gpu_pass_frames, order.size());
+        for (size_t i = 0; i < order.size() && i < 24; ++i) {
+          std::fprintf(out, "  %6.3f ms %5.1f%% %s\n", order[i].first / 1e6 / g_gpu_pass_frames,
+                       total ? 100.0 * order[i].first / total : 0.0,
+                       g_gpu_pass_names[order[i].second].c_str());
+        }
+        std::fclose(out);
+      }
+      std::memset(g_gpu_pass_ns, 0, sizeof(g_gpu_pass_ns));
+      g_gpu_pass_frames = 0;
+      g_gpu_pass_reports = 0;
+    }
+  }
+  // Draws are timed per pass; gp_draw stays the sum of all of them.
+  const double draw_ms =
+      ms[GpuProf::kDraw] +
+      (frames ? static_cast<double>(pass_ns_sum) / 1e6 / static_cast<double>(frames) : 0.0);
+  char text[384];
   std::snprintf(text, sizeof(text),
                 " gp_n=%llu gp_frame=%.3f gp_draw=%.3f gp_rtx=%.3f gp_res=%.3f gp_tex=%.3f "
-                "gp_up=%.3f gp_pres=%.3f gp_oth=%.3f gp_marks=%llu",
+                "gp_texr=%.3f gp_dump=%.3f gp_up=%.3f gp_pres=%.3f gp_oth=%.3f gp_marks=%llu",
                 static_cast<unsigned long long>(frames),
                 frames ? static_cast<double>(frame_ns) / 1e6 / static_cast<double>(frames) : 0.0,
-                ms[GpuProf::kDraw], ms[GpuProf::kRtTransfer], ms[GpuProf::kResolve],
-                ms[GpuProf::kTexLoad], ms[GpuProf::kUpload], ms[GpuProf::kPresent],
-                ms[GpuProf::kOther], static_cast<unsigned long long>(frames ? marks / frames : 0));
+                draw_ms, ms[GpuProf::kRtTransfer], ms[GpuProf::kResolve],
+                ms[GpuProf::kTexLoad], ms[GpuProf::kTexLoadResolved],
+                ms[GpuProf::kResolveDump], ms[GpuProf::kUpload],
+                ms[GpuProf::kPresent], ms[GpuProf::kOther],
+                static_cast<unsigned long long>(frames ? marks / frames : 0));
   return text;
 }
 
@@ -2531,6 +2701,9 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   if (edram_mode == xenos::EDRAMMode::kCopy) {
     return IssueCopy();
   }
+  DrawCycleScope draw_cycle_scope;
+  REXGPU_DRAW_PHASE_DECLARE();
+  REXGPU_DRAW_PHASE("dr_shaders");
 
   bool surface_pitch_is_zero = regs.Get<xenos::reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -2577,6 +2750,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   }
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  REXGPU_DRAW_PHASE("dr_begin_prim");
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2589,6 +2763,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     return true;
   }
 
+  REXGPU_DRAW_PHASE("dr_modifications");
   xenos::reg::RB_DEPTHCONTROL normalized_depth_control =
       draw_state::GetNormalizedDepthControl(regs);
 
@@ -2616,6 +2791,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   // scale, the shader would see positions it does not expect), and every covered sample simply
   // overwritten - depth and stencil tests always pass, no blending, no alpha test or alpha to mask.
   // Untextured geometry such as stencil light volumes tests depth and is excluded.
+  REXGPU_DRAW_PHASE("dr_rtcache");
   {
     bool clear_like =
         !pixel_shader ||
@@ -2657,6 +2833,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     return false;
   }
 
+  REXGPU_DRAW_PHASE("dr_translation");
   // Translation precedes the pipeline, which needs the used textures and render target formats.
   D3D12Shader::D3D12Translation* vertex_shader_translation =
       static_cast<D3D12Shader::D3D12Translation*>(
@@ -2676,6 +2853,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   } else {
     bound_depth_and_color_render_target_bits = 0;
   }
+  REXGPU_DRAW_PHASE("dr_pipeline");
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
   if (!pipeline_cache_->ConfigurePipeline(
@@ -2689,6 +2867,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     return true;
   }
 
+  REXGPU_DRAW_PHASE("dr_textures");
   // Updating textures may bind pipelines.
   u32 used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
@@ -2702,6 +2881,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     current_external_pipeline_ = nullptr;
   }
 
+  REXGPU_DRAW_PHASE("dr_viewport");
   u32 draw_resolution_scale_x = texture_cache_->GetDrawResolutionScaleX();
   u32 draw_resolution_scale_y = texture_cache_->GetDrawResolutionScaleY();
   // A 4x view drawn into the 1x render targets owning its EDRAM (gpu.d3d12.msaa_4x_alias_as_1x):
@@ -2751,18 +2931,22 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
 
+  REXGPU_DRAW_PHASE("dr_fixed_function");
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
+  REXGPU_DRAW_PHASE("dr_sysconst");
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
 
+  REXGPU_DRAW_PHASE("dr_bindings");
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on.
 
+  REXGPU_DRAW_PHASE("dr_vfetch");
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->GetConstantRegisterMap();
   for (u32 i = 0; i < rex::CountOf(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     u32 vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2827,6 +3011,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     }
   }
 
+  REXGPU_DRAW_PHASE("dr_record");
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
   if (primitive_processing_result.IsTessellated()) {
     switch (primitive_processing_result.host_primitive_type) {
@@ -2897,6 +3082,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
+    GpuProfSetDrawPass();
     REX_PERF_INC("draw_calls");
     REX_PERF_ADD("vertices_processed", primitive_processing_result.host_draw_vertex_count);
     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
@@ -2954,6 +3140,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
+    GpuProfSetDrawPass();
     REX_PERF_INC("draw_calls");
     REX_PERF_ADD("vertices_processed", primitive_processing_result.host_draw_vertex_count);
     deferred_command_list_.D3DDrawIndexedInstanced(
@@ -2963,6 +3150,7 @@ bool D3D12CommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim
     }
   }
 
+  REXGPU_DRAW_PHASE_END();
   if (memexport_used) {
     shared_memory_->MarkUAVWritesCommitNeeded();
     if (!memexport_ranges_.empty()) {
@@ -3617,6 +3805,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+    texture_cache_->ResolveToTextureVerifyTick();
 
     GpuProfBeginFrame();
     shared_memory_->PrefetchHotRanges();

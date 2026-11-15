@@ -12,12 +12,20 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <format>
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
+#include <rex/chrono.h>
 #include <rex/platform/perf.h>
 #include "gpu/xenos/d3d12/command_processor.h"
 #include "gpu/xenos/d3d12/shared_memory.h"
@@ -606,6 +614,9 @@ bool D3D12TextureCache::Initialize() {
 
 void D3D12TextureCache::ClearCache() {
   TextureCache::ClearCache();
+  resolve_rtvs_.clear();
+  resolve_shadows_.clear();
+  resolve_compares_.clear();
   TrimRecyclePool(0);
 
   srv_descriptor_cache_free_.clear();
@@ -663,6 +674,9 @@ void D3D12TextureCache::RequestTextures(u32 used_texture_mask) {
 
   TextureCache::RequestTextures(used_texture_mask);
 
+#ifdef REXGLUE_ENABLE_PROFILING
+  ZoneNamedN(rexgpu_tex_d3d12, "tex_d3d12_states", TracyIsStarted);
+#endif
   // Loading 3D as 2D textures may bind compute pipelines, so they are created here.
   if (command_processor_.GetXenosSettings().texture_3d_to_2d.Get()) {
     u32 textures_3d = used_texture_mask;
@@ -1486,6 +1500,17 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   // Untiling goes through a buffer rather than unordered access, as copying is infrequent.
   desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  // resolve_to_texture writes single-level k_8_8_8_8 textures of recently resolved memory directly.
+  if (command_processor_.GetD3D12Settings().resolve_to_texture.Get() &&
+      (key.format == xenos::TextureFormat::k_8_8_8_8 ||
+       key.format == xenos::TextureFormat::k_2_10_10_10 ||
+       key.format == xenos::TextureFormat::k_24_8_FLOAT) &&
+      key.mip_max_level == 0 && key.tiled &&
+      !key.scaled_resolve && key.dimension == xenos::DataDimension::k2DOrStacked &&
+      key.GetDepthOrArraySize() == 1 &&
+      WasRangeRecentlyResolved(key.base_page << 12, key.GetWidth() * key.GetHeight() * 4)) {
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  }
   const gpu::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1512,6 +1537,8 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 }
 
 void D3D12TextureCache::OnTextureEvicted(Texture& texture) {
+  resolve_rtvs_.erase(&texture);
+  resolve_shadows_.erase(&texture);
   const u64 limit =
       static_cast<u64>(command_processor_.GetD3D12Settings().texture_recycle_pool_mb.Get()) << 20;
   if (!limit) {
@@ -1561,7 +1588,15 @@ void D3D12TextureCache::TrimRecyclePool(u64 limit_bytes) {
 
 bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, bool load_base,
                                                               bool load_mips) {
-  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), GpuProf::kTexLoad);
+  // Loads of data a resolve just wrote (render to texture) are timed separately (gp_texr).
+  const bool resolved_source =
+      (load_base && WasRangeRecentlyResolved(texture.GetKey().base_page << 12,
+                                             texture.GetGuestBaseSize())) ||
+      (load_mips && WasRangeRecentlyResolved(texture.GetKey().mip_page << 12,
+                                             texture.GetGuestMipsSize()));
+  GpuProfScope gpu_prof_scope(command_processor_.gpu_prof(), resolved_source
+                                                                 ? GpuProf::kTexLoadResolved
+                                                                 : GpuProf::kTexLoad);
   command_processor_.GuardAsyncReplay(16);
   auto replay_lock = command_processor_.LockAsyncReplay(16);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
@@ -1890,7 +1925,76 @@ bool D3D12TextureCache::LoadHostTextureDataFromResidentMemory(Texture& texture, 
   if (load_base) {
     d3d12_texture.BumpBaseLoadGeneration();
   }
+  if (command_processor_.GetD3D12Settings().texture_load_census.Get()) {
+    TextureLoadCensusRecord(texture, load_base, load_mips);
+  }
   return true;
+}
+
+void D3D12TextureCache::TextureLoadCensusRecord(const Texture& texture, bool load_base,
+                                                bool load_mips) {
+  // Command thread only. Keyed by the texture object; the key text is kept for the report.
+  struct Entry {
+    u64 loads = 0;
+    u64 bytes = 0;
+    u64 resolved = 0;
+    std::string text;
+  };
+  static std::unordered_map<const Texture*, Entry> entries;
+  static u64 total_loads = 0, total_bytes = 0;
+  static auto window_start = std::chrono::steady_clock::now();
+
+  const TextureKey& key = texture.GetKey();
+  u64 bytes = (load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0);
+  Entry& e = entries[&texture];
+  if (e.text.empty()) {
+    e.text = std::format("{}x{}x{} {} {}{}base 0x{:08X} mips 0x{:08X} lv{}", key.GetWidth(),
+                         key.GetHeight(), key.GetDepthOrArraySize(),
+                         xenos::FormatInfo::Get(key.format)->name, key.tiled ? "tiled " : "linear ",
+                         key.dimension == xenos::DataDimension::k3D ? "3D " : "",
+                         key.base_page << 12, key.mip_page << 12, key.mip_max_level + 1);
+  }
+  ++e.loads;
+  if ((load_base && WasRangeRecentlyResolved(key.base_page << 12, texture.GetGuestBaseSize())) ||
+      (load_mips && WasRangeRecentlyResolved(key.mip_page << 12, texture.GetGuestMipsSize()))) {
+    ++e.resolved;
+  }
+  e.bytes += bytes;
+  ++total_loads;
+  total_bytes += bytes;
+
+  auto now = std::chrono::steady_clock::now();
+  double secs = std::chrono::duration<double>(now - window_start).count();
+  if (secs < 10.0) {
+    return;
+  }
+  std::vector<const Entry*> sorted;
+  sorted.reserve(entries.size());
+  for (const auto& [ptr, entry] : entries) {
+    sorted.push_back(&entry);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const Entry* a, const Entry* b) { return a->bytes > b->bytes; });
+  std::FILE* out = nullptr;
+  if (fopen_s(&out, "mp_texload.txt", "a") == 0 && out) {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_local;
+    localtime_s(&tm_local, &t);
+    std::fprintf(out, "%02d:%02d:%02d %.1fs loads/s=%.1f KB/s=%.1f textures=%zu\n",
+                 tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec, secs, total_loads / secs,
+                 total_bytes / 1024.0 / secs, entries.size());
+    for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
+      std::fprintf(out, "  %5.1f%% loads/s=%.1f resolved/s=%.1f KB/s=%.1f %s\n",
+                   total_bytes ? 100.0 * sorted[i]->bytes / total_bytes : 0.0, sorted[i]->loads / secs,
+                   sorted[i]->resolved / secs, sorted[i]->bytes / 1024.0 / secs,
+                   sorted[i]->text.c_str());
+    }
+    std::fclose(out);
+  }
+  entries.clear();
+  total_loads = 0;
+  total_bytes = 0;
+  window_start = now;
 }
 
 void D3D12TextureCache::UpdateHostTextureBindings(u32 fetch_constant_mask) {
@@ -2223,6 +2327,266 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+// resolve_to_texture (bo2-dev): a resolve copied straight from the host render target into the
+// texture that samples the same memory, instead of reloading it from guest memory.
+
+bool D3D12TextureCache::PrepareResolveToTexture(u32 base_address, u32 width, u32 height,
+                                                u32 pitch_div_32, xenos::Endian128 endian,
+                                                xenos::TextureFormat texture_format,
+                                                ResolveToTextureTarget& target_out) {
+  target_out = {};
+  const auto& settings = command_processor_.GetD3D12Settings();
+  if (!settings.resolve_to_texture.Get() || IsDrawResolutionScaled()) {
+    return false;
+  }
+  const bool verify = settings.resolve_to_texture_verify.Get();
+  std::vector<Texture*> candidates;
+  FindTexturesAtBasePage((base_address & 0x1FFFFFFF) >> 12, candidates);
+  D3D12Texture* match = nullptr;
+  for (Texture* candidate : candidates) {
+    const TextureKey& key = candidate->GetKey();
+    if (key.format == texture_format &&
+        key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() == 1 &&
+        key.mip_max_level == 0 && key.tiled && !key.scaled_resolve && !key.signed_separate &&
+        key.GetWidth() == width && key.GetHeight() == height && key.pitch == pitch_div_32 &&
+        static_cast<u32>(key.endianness) == static_cast<u32>(endian)) {
+      match = static_cast<D3D12Texture*>(candidate);
+      break;
+    }
+  }
+  if (!match) {
+    return false;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!resolve_rtv_pool_) {
+    resolve_rtv_pool_ = std::make_shared<gpu::d3d12::D3D12CPUDescriptorPool>(
+        command_processor_.GetD3D12Provider(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 6);
+  }
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = GetDXGIUnormFormat(match->GetKey());
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+  rtv_desc.Texture2DArray.MipSlice = 0;
+  rtv_desc.Texture2DArray.FirstArraySlice = 0;
+  rtv_desc.Texture2DArray.ArraySize = 1;
+  rtv_desc.Texture2DArray.PlaneSlice = 0;
+  if (verify) {
+    ResolveShadow& shadow = resolve_shadows_[match];
+    if (!shadow.resource) {
+      D3D12_RESOURCE_DESC desc = match->GetResource()->GetDesc();
+      desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      if (FAILED(device->CreateCommittedResource(
+              &gpu::d3d12::objects::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&shadow.resource)))) {
+        resolve_shadows_.erase(match);
+        return false;
+      }
+      shadow.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      shadow.rtv = resolve_rtv_pool_->AllocateDescriptor();
+      device->CreateRenderTargetView(shadow.resource.Get(), &rtv_desc, shadow.rtv.GetHandle());
+    }
+    command_processor_.PushTransitionBarrier(shadow.resource.Get(), shadow.state,
+                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+    shadow.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    target_out.resource = shadow.resource.Get();
+    target_out.rtv = shadow.rtv.GetHandle();
+  } else {
+    ID3D12Resource* resource = match->GetResource();
+    if (!(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+      return false;  // Created before it was known to be a resolve target; loaded normally.
+    }
+    ResolveRTV& rtv = resolve_rtvs_[match];
+    if (rtv.resource != resource || !rtv.descriptor) {
+      if (!rtv.descriptor) {
+        rtv.descriptor = resolve_rtv_pool_->AllocateDescriptor();
+      }
+      device->CreateRenderTargetView(resource, &rtv_desc, rtv.descriptor.GetHandle());
+      rtv.resource = resource;
+    }
+    command_processor_.PushTransitionBarrier(
+        resource, match->SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    target_out.resource = resource;
+    target_out.rtv = rtv.descriptor.GetHandle();
+  }
+  match->MarkAsUsed();
+  target_out.texture = match;
+  target_out.rtv_format = rtv_desc.Format;
+  target_out.width = width;
+  target_out.height = height;
+  target_out.verify = verify;
+  return true;
+}
+
+void D3D12TextureCache::FinishResolveToTexture(const ResolveToTextureTarget& target) {
+  auto& texture = *static_cast<D3D12Texture*>(target.texture);
+  if (target.verify) {
+    ResolveShadow& shadow = resolve_shadows_[&texture];
+    if (shadow.blit_frame != GetFrameIndex()) {
+      shadow.blits_in_frame = 0;
+    }
+    shadow.blit_frame = GetFrameIndex();
+    shadow.load_generation_at_blit = texture.GetBaseLoadGeneration();
+    ++shadow.blits_in_frame;
+    return;
+  }
+  // The resolve's RangeWrittenByGPU already marked the texture outdated; it now holds that data.
+  {
+    auto watch_lock = GetSharedMemory().AcquireLock();
+    texture.UpdateAndWatch(watch_lock);
+  }
+  texture.BumpBaseLoadGeneration();
+  resolve_direct_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void D3D12TextureCache::ResolveToTextureVerifyTick() {
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  // Evaluate the finished comparisons.
+  const u64 completed = command_processor_.GetCompletedSubmission();
+  for (auto it = resolve_compares_.begin(); it != resolve_compares_.end();) {
+    if (it->submission > completed) {
+      ++it;
+      continue;
+    }
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, static_cast<SIZE_T>(it->offset_shadow * 2)};
+    if (SUCCEEDED(it->readback->Map(0, &read_range, &mapping))) {
+      const u8* loaded = static_cast<const u8*>(mapping);
+      const u8* shadow = loaded + it->offset_shadow;
+      u64 bad = 0, bad_swapped = 0, nonzero = 0;
+      u32 first_x = 0, first_y = 0, first_loaded = 0, first_shadow = 0;
+      for (u32 y = 0; y < it->height; ++y) {
+        const u32* a = reinterpret_cast<const u32*>(loaded + y * it->row_pitch);
+        const u32* b = reinterpret_cast<const u32*>(shadow + y * it->row_pitch);
+        for (u32 x = 0; x < it->width; ++x) {
+          u32 bs = (b[x] & 0xFF00FF00u) | ((b[x] & 0xFFu) << 16) | ((b[x] >> 16) & 0xFFu);
+          if (a[x] != b[x]) {
+            if (!bad) {
+              first_x = x;
+              first_y = y;
+              first_loaded = a[x];
+              first_shadow = b[x];
+            }
+            ++bad;
+          }
+          if (a[x] != bs) {
+            ++bad_swapped;
+          }
+          if (a[x] & 0x00FFFFFFu) {
+            ++nonzero;
+          }
+        }
+      }
+      D3D12_RANGE write_range = {0, 0};
+      it->readback->Unmap(0, &write_range);
+      if (!bad && !nonzero) {
+        // Blank (all black) content proves nothing.
+      } else if (!bad) {
+        resolve_verify_ok_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        resolve_verify_bad_.fetch_add(1, std::memory_order_relaxed);
+        if (!bad_swapped) {
+          resolve_verify_swap_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      u32& logged = resolve_verify_logged_by_size_[(u64{it->base_address} << 16) ^ it->width];
+      if (bad || logged < 8) {
+        ++logged;
+        REXGPU_WARN(
+            "resolve_to_texture verify {}x{} base 0x{:08X}: {} of {} texels differ ({} with "
+            "red/blue swapped), {} non-black; first at {},{} loaded {:08X} direct {:08X}",
+            it->width, it->height, it->base_address, bad, u64{it->width} * it->height,
+            bad_swapped, nonzero, first_x, first_y, first_loaded, first_shadow);
+      }
+    }
+    it = resolve_compares_.erase(it);
+  }
+
+  // Start a new comparison at most every second.
+  if (!command_processor_.GetD3D12Settings().resolve_to_texture_verify.Get() ||
+      !resolve_compares_.empty()) {
+    return;
+  }
+  const u64 now = rex::Clock::QueryHostUptimeMillis();
+  if (now < resolve_compare_next_time_) {
+    return;
+  }
+  // Round robin: the eligible shadow compared longest ago.
+  const Texture* chosen = nullptr;
+  u64 chosen_time = UINT64_MAX;
+  for (auto& [candidate_ptr, candidate] : resolve_shadows_) {
+    auto& candidate_texture =
+        *const_cast<D3D12Texture*>(static_cast<const D3D12Texture*>(candidate_ptr));
+    // The previous frame's single resolve, which the normal path has loaded since.
+    // Blitted in the previous frame and reloaded after its last blit: both hold that resolve.
+    if (candidate.blit_frame + 1 != GetFrameIndex() ||
+        candidate_texture.GetBaseLoadGeneration() <= candidate.load_generation_at_blit) {
+      continue;
+    }
+    if (candidate.last_compare_time < chosen_time) {
+      chosen_time = candidate.last_compare_time;
+      chosen = candidate_ptr;
+    }
+  }
+  if (chosen) {
+    const Texture* texture_ptr = chosen;
+    ResolveShadow& shadow = resolve_shadows_[chosen];
+    shadow.last_compare_time = now;
+    auto& texture = *const_cast<D3D12Texture*>(static_cast<const D3D12Texture*>(texture_ptr));
+    D3D12_RESOURCE_DESC desc = texture.GetResource()->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    u64 offset_shadow = (total + 511) & ~u64{511};
+    D3D12_RESOURCE_DESC buffer_desc;
+    gpu::d3d12::objects::FillBufferResourceDesc(buffer_desc, offset_shadow * 2,
+                                                D3D12_RESOURCE_FLAG_NONE);
+    ResolveCompare compare;
+    if (FAILED(device->CreateCommittedResource(&gpu::d3d12::objects::kHeapPropertiesReadback,
+                                               D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&compare.readback)))) {
+      return;
+    }
+    command_processor_.PushTransitionBarrier(
+        texture.GetResource(), texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.PushTransitionBarrier(shadow.resource.Get(), shadow.state,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+    shadow.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    command_processor_.SubmitBarriers();
+    D3D12_TEXTURE_COPY_LOCATION dest, source;
+    dest.pResource = compare.readback.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dest.PlacedFootprint = footprint;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = 0;
+    source.pResource = texture.GetResource();
+    auto& command_list = command_processor_.GetDeferredCommandList();
+    command_list.D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+    dest.PlacedFootprint.Offset = offset_shadow;
+    source.pResource = shadow.resource.Get();
+    command_list.D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+    texture.MarkAsUsed();
+    compare.texture = texture_ptr;
+    compare.submission = command_processor_.GetCurrentSubmission();
+    compare.width = footprint.Footprint.Width;
+    compare.height = footprint.Footprint.Height;
+    compare.row_pitch = footprint.Footprint.RowPitch;
+    compare.offset_shadow = offset_shadow;
+    compare.base_address = texture.GetKey().base_page << 12;
+    resolve_compares_.push_back(std::move(compare));
+    resolve_compare_next_time_ = now + 1000;
+    return;
+  }
+}
+
+std::string D3D12TextureCache::ResolveToTextureLogTags() const {
+  return " rtt_n=" + std::to_string(resolve_direct_count_.load(std::memory_order_relaxed)) +
+         " rtt_ok=" + std::to_string(resolve_verify_ok_.load(std::memory_order_relaxed)) +
+         " rtt_bad=" + std::to_string(resolve_verify_bad_.load(std::memory_order_relaxed)) +
+         " rtt_swap=" + std::to_string(resolve_verify_swap_.load(std::memory_order_relaxed));
 }
 
 }  // namespace rex::gpu::d3d12

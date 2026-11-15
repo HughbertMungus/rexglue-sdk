@@ -75,6 +75,17 @@ class D3D12Settings : public SettingOwner {
               "resolves, texture loads, uploads, present) with timestamp queries; the fps log "
               "(REX_FPS_LOG=1) gets gp_* fields in ms per profiled frame. 0 turns it off",
               Range{0, 1000});
+  REX_SETTING(bool, resolve_to_texture, false,
+              "Copy a resolve straight from the host render target into a texture that samples "
+              "the same memory (exact match, k_8_8_8_8 1x only) instead of reloading it");
+  REX_SETTING(bool, resolve_to_texture_verify, false,
+              "With resolve_to_texture: copy into a shadow texture instead, keep the normal reload, "
+              "and compare both now and then (fps log rtt_ok= / rtt_bad= / rtt_swap=)");
+  REX_SETTING(bool, resolve_to_texture_invert_swap, false,
+              "Diagnostic: invert the red/blue swap rule of resolve_to_texture");
+  REX_SETTING(bool, texture_load_census, false,
+              "Count texture data loads by texture (loads and bytes), the top ones every 10 seconds "
+              "in mp_texload.txt in the working folder");
   REX_SETTING(bool, rt_transfer_census, false,
               "Count render target ownership transfers by kind and by source -> destination render "
               "target, one line a second in mp_rtx.txt (needs REX_FPS_LOG=1)");

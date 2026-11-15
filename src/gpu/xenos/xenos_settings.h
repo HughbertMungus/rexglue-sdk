@@ -52,6 +52,22 @@ class XenosSettings : public SettingOwner {
               Range{128, 8192}, kRestart);
   REX_SETTING(i32, texture_cache_memory_limit_soft_lifetime, 30,
               "Soft texture cache memory limit lifetime (seconds)", Range{1, 3600});
+  REX_SETTING(bool, texture_cpu_written_reload_per_frame, false,
+              "Reload a texture whose memory the CPU keeps writing once per frame instead of on "
+              "every draw that binds it (its data stays outdated after each load)");
+  REX_SETTING(bool, texture_cpu_written_reload_skip_same_frame, false,
+              "With texture_cpu_written_reload_per_frame, also skip reloading such a texture when "
+              "other textures' invalidations reset the bindings again within the same frame");
+  REX_SETTING(bool, render_target_update_fast_path, true,
+              "Skip the render target lookup and EDRAM ownership update for a draw with the same "
+              "render targets as the previous one when no ownership changed since and the draw "
+              "does not extend further (the result would be identical)");
+  REX_SETTING(bool, render_target_update_fast_path_verify, false,
+              "With render_target_update_fast_path, run the full update anyway where the fast "
+              "path applies and count disagreements (fps log rfm=)");
+  REX_SETTING(bool, texture_lookup_memo, true,
+              "Remember recent fetch constant key -> texture lookups, so a slot switching back to a "
+              "texture skips the texture map lookup and the scaled resolve layout computation");
   REX_SETTING(bool, pre_mask_resolve_l2_block, true,
               "Mask scaled resolve L2 blocks to the write range before iterating");
   REX_SETTING(bool, force_convert_line_loops_to_strips, false,
